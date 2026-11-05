@@ -173,7 +173,7 @@ function loadNewAccountDefaults(): Required<NewAccountDefaults> {
   return {
     cash: src.cash ?? '1000000',
     commissionWan: src.commissionWan ?? '2.5',   // 万2.5
-    stampQian: src.stampQian ?? '1',             // 千1 (仅卖出)
+    stampQian: src.stampQian ?? '',              // 留空按成交日计税
     slippageBps: src.slippageBps ?? '5',         // 5bps
   }
 }
@@ -220,7 +220,7 @@ function SetupCard({ accId, onDone, onCancel }: { accId: string; onDone: (create
         account_id: accId,
         name: name.trim() || autoLabel || undefined,
         commission_pct: Number(commissionWan) / 10000,   // 万 X → pct
-        stamp_tax_pct: Number(stampQian) / 1000,         // 千 X → pct
+        stamp_tax_pct: stampQian.trim() === '' ? null : Number(stampQian) / 1000,         // 千 X → pct
         slippage_bps: Number(slippageBps),
       })
       if (autoId.trim()) {
@@ -312,7 +312,7 @@ function SetupCard({ accId, onDone, onCancel }: { accId: string; onDone: (create
         </div>
         <div>
           <label className="block text-[11px] text-muted">印花税 (千)</label>
-          <input type="number" step="0.1" min="0" value={stampQian} onChange={e => setStampQian(e.target.value)}
+          <input type="number" step="0.1" min="0" placeholder="按成交日" value={stampQian} onChange={e => setStampQian(e.target.value)}
             className="mt-1 w-full rounded-btn border border-border bg-base px-2 py-2 font-mono text-sm outline-none focus:border-accent/50" />
         </div>
         <div>
@@ -852,21 +852,23 @@ function CandidateCompareCard({ paper }: { paper: PaperCompareStats }) {
 // ================================================================
 function FeeSettingsModal({ accId, fees, queue, onSaved, onClose }: {
   accId: string
-  fees: { commission_pct: number; stamp_tax_pct: number; slippage_bps: number }
+  fees: { commission_pct: number; stamp_tax_pct: number | null; slippage_bps: number; fee_model?: 'legacy' | 'ashare_v1' }
   queue: boolean
   onSaved: () => void
   onClose: () => void
 }) {
+  const [feeModel, setFeeModel] = useState<'legacy' | 'ashare_v1'>(fees.fee_model ?? 'legacy')
   const [commissionWan, setCommissionWan] = useState((fees.commission_pct * 10000).toFixed(2))
-  const [stampQian, setStampQian] = useState((fees.stamp_tax_pct * 1000).toFixed(2))
+  const [stampQian, setStampQian] = useState(fees.stamp_tax_pct == null ? '' : String(fees.stamp_tax_pct * 1000))
   const [slippageBps, setSlippageBps] = useState(String(fees.slippage_bps))
   const [queueOn, setQueueOn] = useState(queue)
   const [err, setErr] = useState<string | null>(null)
   const qc = useQueryClient()
   const m = useMutation({
     mutationFn: () => api.paperSettings({
+      fee_model: feeModel,
       commission_pct: Number(commissionWan) / 10000,   // 万 X → pct
-      stamp_tax_pct: Number(stampQian) / 1000,         // 千 X → pct
+      stamp_tax_pct: stampQian.trim() === '' ? null : Number(stampQian) / 1000,         // 千 X → pct
       slippage_bps: Number(slippageBps),
       queue_limit_orders: queueOn,
     }, accId),
@@ -892,8 +894,14 @@ function FeeSettingsModal({ accId, fees, queue, onSaved, onClose }: {
           </h3>
         </div>
         <p className="mt-2 text-[11px] leading-relaxed text-muted">
-          仅影响之后的新成交, 已有台账与统计不重算。口径与回测费用模型一致。
+          仅影响之后的新成交, 已有台账与统计不重算。{feeModel === 'ashare_v1' ? '印花税留空按成交日计税，填0表示免税。' : '原模式印花税留空为0。'}
         </p>
+        <label className="block mt-3 text-[11px] text-muted">费用模型
+          <select value={feeModel} onChange={e => setFeeModel(e.target.value as 'legacy' | 'ashare_v1')} className={inputCls}>
+            <option value="ashare_v1">A股金额费用（最低佣金5元、股票过户费）</option>
+            <option value="legacy">原模拟盘费用（无过户费）</option>
+          </select>
+        </label>
         <div className="mt-4 grid grid-cols-3 gap-2">
           <div>
             <label className="block text-[11px] text-muted">佣金 (万)</label>
@@ -901,7 +909,7 @@ function FeeSettingsModal({ accId, fees, queue, onSaved, onClose }: {
           </div>
           <div>
             <label className="block text-[11px] text-muted">印花税 (千, 卖出)</label>
-            <input type="number" step="0.1" min="0" max="50" value={stampQian} onChange={e => setStampQian(e.target.value)} className={inputCls} />
+            <input type="number" step="0.1" min="0" max="50" placeholder={feeModel === 'ashare_v1' ? '按成交日' : '0'} value={stampQian} onChange={e => setStampQian(e.target.value)} className={inputCls} />
           </div>
           <div>
             <label className="block text-[11px] text-muted">滑点 (bps)</label>
@@ -980,7 +988,7 @@ function BaseDefaultsModal({ onClose }: { onClose: () => void }) {
           </div>
           <div>
             <label className="block text-[11px] text-muted">印花税 (千, 卖出)</label>
-            <input type="number" step="0.1" min="0" max="50" value={stampQian} onChange={e => setStampQian(e.target.value)} className={inputCls} />
+            <input type="number" step="0.1" min="0" max="50" placeholder="按成交日" value={stampQian} onChange={e => setStampQian(e.target.value)} className={inputCls} />
           </div>
           <div>
             <label className="block text-[11px] text-muted">滑点 (bps)</label>
@@ -1849,7 +1857,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
         initial_cash: Number(cash),
         name_prefix: prefix.trim() || undefined,
         commission_pct: Number(commissionWan) / 10000,   // 万 X → pct
-        stamp_tax_pct: Number(stampQian) / 1000,         // 千 X → pct
+        stamp_tax_pct: stampQian.trim() === '' ? null : Number(stampQian) / 1000,         // 千 X → pct
         slippage_bps: Number(slippageBps),
         sources: rows.map(r => ({
           name: r.name.trim() || undefined,
@@ -2056,7 +2064,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
             </div>
             <div>
               <label className={labelCls}>印花税 (千)</label>
-              <input type="number" step="0.1" min="0" value={stampQian} onChange={e => setStampQian(e.target.value)} className={cn(inputCls, 'mt-1')} />
+              <input type="number" step="0.1" min="0" placeholder="按成交日" value={stampQian} onChange={e => setStampQian(e.target.value)} className={cn(inputCls, 'mt-1')} />
             </div>
             <div>
               <label className={labelCls}>滑点 (bps)</label>
@@ -2229,10 +2237,10 @@ function AccountPanel({ acc, name, onDeleted }: { acc: string; name?: string; on
         <button
           onClick={() => setFeeOpen(true)}
           className="ml-auto flex items-center gap-1 rounded-btn border border-border px-2 py-0.5 text-[11px] text-muted transition-colors hover:border-accent/40 hover:text-accent"
-          title={`佣金 ${((ov.fees?.commission_pct ?? 0) * 10000).toFixed(1)}‱ (最低5元) · 印花税 ${((ov.fees?.stamp_tax_pct ?? 0) * 1000).toFixed(1)}‰ 仅卖出 · 滑点 ${ov.fees?.slippage_bps ?? 0}bps — 点击调整`}
+          title={`佣金 ${((ov.fees?.commission_pct ?? 0) * 10000).toFixed(1)}‱ (最低5元) · 印花税 ${ov.fees?.stamp_tax_pct == null ? (ov.fees?.fee_model === "ashare_v1" ? "按成交日" : "0‰") : `${(ov.fees.stamp_tax_pct * 1000).toFixed(1)}‰`} 仅卖出 · 滑点 ${ov.fees?.slippage_bps ?? 0}bps — 点击调整`}
         >
           <Settings className="h-3 w-3" />
-          佣金 {((ov.fees?.commission_pct ?? 0) * 10000).toFixed(1)}‱ · 印花税 {((ov.fees?.stamp_tax_pct ?? 0) * 1000).toFixed(1)}‰ · 滑点 {ov.fees?.slippage_bps ?? 0}bps
+          佣金 {((ov.fees?.commission_pct ?? 0) * 10000).toFixed(1)}‱ · 印花税 {ov.fees?.stamp_tax_pct == null ? (ov.fees?.fee_model === 'ashare_v1' ? '按成交日' : '0‰') : `${(ov.fees.stamp_tax_pct * 1000).toFixed(1)}‰`} · 滑点 {ov.fees?.slippage_bps ?? 0}bps
         </button>
         <button
           onClick={() => api.paperFreeze(ov.status !== 'frozen', acc).then(invalidateAll)}

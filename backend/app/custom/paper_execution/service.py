@@ -7,12 +7,13 @@ import json
 import logging
 import math
 import threading
-from datetime import datetime, time
+from datetime import date, datetime, time
 from pathlib import Path
 
 from app.market_time import CN_TZ, cn_now, in_continuous_session
 from app.services.fs_utils import atomic_write_text
 from app.strategy import paper, paper_auto
+from app.trading_costs import FeePolicy
 
 from .snapshot import DIFFERENCES, check_revision, digest, make_snapshot
 
@@ -143,7 +144,7 @@ class ExecutionService:
                     raise ValueError("存在启用的旧跟单规则，请确认停用后再绑定")
                 snapshot = preview["snapshot"]
                 # 已有账务不修改；仅允许首次空账户同步成本参数。
-                if orders and any(acc[k] != v for k, v in snapshot["fees"].items()):
+                if orders and any(acc.get(k, "legacy" if k == "fee_model" else None) != v for k, v in {"fee_model": "legacy", **snapshot["fees"]}.items()):
                     raise ValueError("账户已有成交记录且费用与新快照不同，请新建账户")
                 if not math.isclose(acc["initial_cash"], snapshot["initial_capital"], abs_tol=0.01):
                     raise ValueError(
@@ -176,7 +177,7 @@ class ExecutionService:
                         paper_auto.set_enabled(self.data_dir, rule["id"], True, account)
                     if not orders:
                         paper.update_settings(
-                            self.data_dir, account, **{k: acc[k] for k in snapshot["fees"]}
+                            self.data_dir, account, **{k: acc.get(k, "legacy" if k == "fee_model" else None) for k in snapshot["fees"]}
                         )
                     raise
                 return self.get(account)
@@ -204,7 +205,7 @@ class ExecutionService:
             raise ValueError("模拟账户不存在或已冻结")
         if paper_auto.load_auto_rules(self.data_dir, account, enabled_only=True):
             raise ValueError("检测到启用的旧跟单规则，请停用后恢复快照跟单")
-        if any(acc[k] != v for k, v in state["snapshot"]["fees"].items()):
+        if any(acc.get(k, "legacy" if k == "fee_model" else None) != v for k, v in {"fee_model": "legacy", **state["snapshot"]["fees"]}.items()):
             raise ValueError("模拟账户费用已改变，请恢复为快照费率后重新启用")
         orders = paper.load_orders(self.data_dir, account)
         if any(not str(o.get("source", "")).startswith(PREFIX) for o in orders):
@@ -481,11 +482,16 @@ class ExecutionService:
                 allocation = min(budget * weight / total_weight, target, available, capacity)
                 price = prices[symbol]
                 # 留出真实佣金和滑点，避免满额委托被资金预检整体拒绝。
-                qty = paper.qty_from_amount(
-                    max(0.0, allocation - paper.MIN_COMMISSION)
-                    / (1 + acc["commission_pct"] + acc["slippage_bps"] / 10000),
-                    price,
-                )
+                if acc.get("fee_model", "legacy") == "ashare_v1":
+                    qty = self._fee_policy(acc).affordable_shares(
+                        max(0.0, allocation), price, date.fromisoformat(day), "stock",
+                    )
+                else:
+                    qty = paper.qty_from_amount(
+                        max(0.0, allocation - paper.MIN_COMMISSION)
+                        / (1 + acc["commission_pct"] + acc["slippage_bps"] / 10000),
+                        price,
+                    )
                 if qty <= 0:
                     self._event(state, symbol, "buy", "signal", "预算不足一手，未下单")
                     continue
@@ -500,9 +506,18 @@ class ExecutionService:
         price = _price(order.get("ref_price"))
         if price is None:
             raise ValueError("待成交买单缺少参考价，不能可靠计算资金占用")
+        if acc.get("fee_model", "legacy") == "ashare_v1":
+            return ExecutionService._fee_policy(acc).cash_value(
+                order["qty"], price, "buy", cn_now().date(), order.get("asset_type", "stock"),
+            )
         return order["qty"] * price * (1 + acc["slippage_bps"] / 10000) + paper.buy_fee(
             order["qty"], price, acc["commission_pct"]
         )
+
+    @staticmethod
+    def _fee_policy(acc: dict) -> FeePolicy:
+        return FeePolicy(commission_pct=acc["commission_pct"],
+                         stamp_tax_pct=acc["stamp_tax_pct"], slippage_bps=acc["slippage_bps"])
 
     def _holding_days(self, positions: dict, day: str) -> dict[str, int]:
         # 批量读取，不持账务锁；按每只股票实际交易日计数，周末不以自然日代替。

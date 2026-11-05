@@ -21,7 +21,7 @@ function SnapshotDetails({ preview }: { preview: ExecutionPreview }) {
       <div><dt className="text-muted">初始资金</dt><dd>{s.initial_capital.toLocaleString('zh-CN')} 元</dd></div>
       <div><dt className="text-muted">股票池</dt><dd>{s.symbols ? `${s.symbols.length} 只` : '全市场 A 股'}</dd></div>
       <div className="col-span-2 break-words"><dt className="text-muted">买点 / 卖点</dt><dd>{s.overrides.entry_signals.join('、') || '策略候选入场'} / {s.overrides.exit_signals.join('、') || '无显式卖点，按风控退出'}</dd></div>
-      <div className="col-span-2"><dt className="text-muted">费用</dt><dd>佣金万 {(s.fees.commission_pct * 10000).toFixed(2)} · 印花税千 {(s.fees.stamp_tax_pct * 1000).toFixed(2)} · 滑点 {s.fees.slippage_bps} bps</dd></div>
+      <div className="col-span-2"><dt className="text-muted">费用</dt><dd>佣金万 {(s.fees.commission_pct * 10000).toFixed(2)} · 印花税千 {s.fees.stamp_tax_pct == null ? '按成交日' : (s.fees.stamp_tax_pct * 1000).toFixed(2)} · 滑点 {s.fees.slippage_bps} bps</dd></div>
     </dl>
     <details><summary className="cursor-pointer text-accent">完整参数、过滤、评分与风控</summary><pre className="mt-2 max-h-56 overflow-auto whitespace-pre-wrap break-all text-[10px] text-secondary">{JSON.stringify({ params: s.params, overrides: s.overrides }, null, 2)}</pre></details>
     <details><summary className="cursor-pointer text-muted">与历史回测的差异</summary><ul className="mt-2 list-disc space-y-1 pl-4 text-[11px] leading-relaxed text-muted">{preview.differences.map(d => <li key={d}>{d}</li>)}</ul></details>

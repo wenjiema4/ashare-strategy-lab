@@ -16,6 +16,7 @@ env:
 
 jobs:
   build-and-push:
+    if: github.event_name == 'workflow_dispatch' || github.repository == 'shy3130/tick-stock-panel'
     runs-on: ubuntu-latest
 
     permissions:

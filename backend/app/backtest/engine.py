@@ -24,11 +24,13 @@ from app.backtest.matrix import (
     MatrixCacheProfile,
     build_market_matrix,
     load_market_data_matrix_from_parquet,
+    panel_has_raw_cash_prices,
 )
 from app.config import settings
 from app.enriched_generation import EnrichedGenerationUnavailableError
 from app.parquet import scan_enriched_parquet
 from app.tickflow.repository import KlineRepository
+from app.trading_costs import FeePolicy
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +120,7 @@ class MatcherConfig:
     fees_pct: float = 0.0002
     commission_pct: float | None = None
     stamp_tax_pct: float | None = None
+    fee_model: Literal["legacy", "ashare_v1"] = "legacy"
     slippage_bps: float = 5.0
     stop_loss_pct: float | None = None
     take_profit_pct: float | None = None
@@ -143,6 +146,10 @@ class MatcherConfig:
     asset_type: str = "stock"
 
     def __post_init__(self) -> None:
+        if self.fee_model not in ("legacy", "ashare_v1"):
+            raise ValueError("Unknown fee_model")
+        if self.fee_model == "ashare_v1":
+            self._fee_policy()
         # 解析最终口径: 优先 entry_fill/exit_fill, 否则回退到 matching (向后兼容)。
         if self.entry_fill is None:
             self.entry_fill = self.matching
@@ -161,6 +168,23 @@ class MatcherConfig:
         # 卖出腿: 佣金 + 印花税 + 滑点。印花税未设时为 0 (向后兼容)。
         stamp = self.stamp_tax_pct if self.stamp_tax_pct is not None else 0.0
         return self._commission_pct() + stamp + self.slippage_bps / 10000.0
+
+    def _fee_policy(self) -> FeePolicy:
+        return FeePolicy(commission_pct=self._commission_pct(), stamp_tax_pct=self.stamp_tax_pct,
+                         slippage_bps=self.slippage_bps)
+
+    def cash_value(self, shares: float, price: float, side: str, day: str) -> float:
+        if shares == 0:
+            return 0.0
+        if self.fee_model == "ashare_v1":
+            return self._fee_policy().cash_value(shares, price, side, date.fromisoformat(str(day)[:10]), self.asset_type)
+        rate = self.buy_cost_pct() if side == "buy" else -self.sell_cost_pct()
+        return shares * price * (1 + rate)
+
+    def affordable_shares(self, budget: float, price: float, day: str) -> float:
+        if self.fee_model == "ashare_v1":
+            return self._fee_policy().affordable_shares(budget, price, date.fromisoformat(str(day)[:10]), self.asset_type)
+        return np.floor(budget / (price * (1 + self.buy_cost_pct())) / 100) * 100
 
 
 @dataclass
@@ -834,6 +858,8 @@ class BacktestEngine:
         exit_signal_ids: list[str] | None = None,
     ) -> SimResult:
         """纯 NumPy 撮合模拟 — 逐 symbol 状态机。"""
+        if config.fee_model != "legacy":
+            raise ValueError("ashare_v1 requires the portfolio or independent matcher")
         if panel.is_empty():
             return self._empty_result()
 
@@ -1009,11 +1035,11 @@ class BacktestEngine:
         cancel_event: "threading.Event | None",
         options: SimulationOptions | None = None,
     ) -> SimResult:
+        if config.fee_model == "ashare_v1" and not matrix.cash_prices_raw:
+            raise ValueError("金额费用回测需要未复权原始价证据；复权持仓账本尚未启用，请使用原比例费用")
         options = options or SimulationOptions()
         entry_prices = self._resolve_entry_prices(matrix, config)
         exit_prices = matrix.open if config.exit_fill == "open_t+1" else matrix.close
-        buy_cost_pct = config.buy_cost_pct()
-        sell_cost_pct = config.sell_cost_pct()
         trades: list[TradeRecord] = []
         execution_stats = {
             "buy_invalid_price": 0,
@@ -1219,8 +1245,8 @@ class BacktestEngine:
                 time_id, asset_id, "sell", float(exit_prices[time_id, asset_id])
             )
             shares = 100.0
-            entry_value = shares * pos["entry_price"] * (1 + buy_cost_pct)
-            exit_value = shares * exit_price * (1 - sell_cost_pct)
+            entry_value = config.cash_value(shares, pos["entry_price"], "buy", pos["entry_date"])
+            exit_value = config.cash_value(shares, exit_price, "sell", matrix.timestamp_labels[time_id][:10])
             pnl_amount = exit_value - entry_value
             trades.append(TradeRecord(
                 symbol=matrix.symbols[asset_id],
@@ -1383,6 +1409,8 @@ class BacktestEngine:
         exit_signal_ids: list[str] | None = None,
     ) -> SimResult:
         """全量候选独立执行：每个买入信号都是独立样本, 不受资金/仓位限制。"""
+        if config.fee_model == "ashare_v1" and not panel_has_raw_cash_prices(panel):
+            raise ValueError("金额费用回测需要未复权原始价证据；复权持仓账本尚未启用，请使用原比例费用")
         if panel.is_empty():
             return self._empty_result()
 
@@ -1509,8 +1537,6 @@ class BacktestEngine:
             row_pos_in_symbol[i] = len(rows)
             rows.append(i)
 
-        buy_cost_pct = config.buy_cost_pct()
-        sell_cost_pct = config.sell_cost_pct()
         score_min = getattr(config, "score_min", None)
         score_max = getattr(config, "score_max", None)
         trades: list[TradeRecord] = []
@@ -1665,8 +1691,8 @@ class BacktestEngine:
             else:
                 exit_price = _refill_price(idx, "sell", float(exit_prices[idx]))
             shares = 100.0
-            entry_value = shares * float(pos["entry_price"]) * (1 + buy_cost_pct)
-            exit_value = shares * exit_price * (1 - sell_cost_pct)
+            entry_value = config.cash_value(shares, float(pos["entry_price"]), "buy", pos["entry_date"])
+            exit_value = config.cash_value(shares, exit_price, "sell", self._date_str(panel_dates[idx]))
             pnl_amount = exit_value - entry_value
             pnl_pct = pnl_amount / entry_value if entry_value > 0 else 0.0
             trades.append(TradeRecord(
@@ -1996,12 +2022,12 @@ class BacktestEngine:
         cancel_event: "threading.Event | None",
         options: SimulationOptions | None = None,
     ) -> SimResult:
+        if config.fee_model == "ashare_v1" and not matrix.cash_prices_raw:
+            raise ValueError("金额费用回测需要未复权原始价证据；复权持仓账本尚未启用，请使用原比例费用")
         options = options or SimulationOptions()
         time_count, asset_count = matrix.shape
         entry_prices = self._resolve_entry_prices(matrix, config)
         exit_prices = matrix.open if config.exit_fill == "open_t+1" else matrix.close
-        buy_cost_pct = config.buy_cost_pct()
-        sell_cost_pct = config.sell_cost_pct()
         cash = float(config.initial_capital)
         peak = cash
         max_positions = max(int(config.max_positions), 0)
@@ -2177,7 +2203,7 @@ class BacktestEngine:
             exit_price = float(override) if override is not None else _refill_price(
                 time_id, asset_id, "sell", float(exit_prices[time_id, asset_id])
             )
-            exit_value = pos["shares"] * exit_price * (1 - sell_cost_pct)
+            exit_value = config.cash_value(pos["shares"], exit_price, "sell", matrix.timestamp_labels[time_id][:10])
             cash += exit_value
             pnl_amount = exit_value - pos["entry_value"]
             pnl_pct = pnl_amount / pos["entry_value"] if pos["entry_value"] > 0 else 0.0
@@ -2406,8 +2432,8 @@ class BacktestEngine:
                             entry_price = _refill_price(
                                 time_id, asset_id, "buy", float(entry_prices[time_id, asset_id])
                             )
-                            shares = np.floor(allocation / (entry_price * (1 + buy_cost_pct)) / 100) * 100
-                            entry_value = shares * entry_price * (1 + buy_cost_pct)
+                            shares = config.affordable_shares(allocation, entry_price, matrix.timestamp_labels[time_id][:10])
+                            entry_value = config.cash_value(shares, entry_price, "buy", matrix.timestamp_labels[time_id][:10])
                             if shares <= 0:
                                 _count("buy_lot_size")
                                 continue
@@ -2539,6 +2565,8 @@ class BacktestEngine:
         exit_signal_ids: list[str] | None = None,
     ) -> SimResult:
         """账户级组合回测：日线信号 → 成交约束 → 仓位/现金撮合。"""
+        if config.fee_model == "ashare_v1" and not panel_has_raw_cash_prices(panel):
+            raise ValueError("金额费用回测需要未复权原始价证据；复权持仓账本尚未启用，请使用原比例费用")
         if panel.is_empty():
             return self._empty_result()
 
@@ -2619,8 +2647,6 @@ class BacktestEngine:
         if not all_dates:
             return self._empty_result()
 
-        buy_cost_pct = config.buy_cost_pct()
-        sell_cost_pct = config.sell_cost_pct()
         cash = float(config.initial_capital)
         peak = cash
         max_positions = max(int(config.max_positions), 0)
@@ -2810,7 +2836,7 @@ class BacktestEngine:
                 exit_price = float(exit_price_override)
             else:
                 exit_price = _refill_price(idx, "sell", float(exit_prices[idx]))
-            exit_value = pos["shares"] * exit_price * (1 - sell_cost_pct)
+            exit_value = config.cash_value(pos["shares"], exit_price, "sell", self._date_str(panel_dates[idx]))
             cash += exit_value
             pnl_amount = exit_value - pos["entry_value"]
             pnl_pct = (exit_value - pos["entry_value"]) / pos["entry_value"] if pos["entry_value"] > 0 else 0.0
@@ -3038,8 +3064,8 @@ class BacktestEngine:
                     _count("buy_exposure")
                     continue
                 entry_price = _refill_price(idx, "buy", float(entry_prices[idx]))
-                shares = np.floor(allocation / (entry_price * (1 + buy_cost_pct)) / 100) * 100
-                entry_value = shares * entry_price * (1 + buy_cost_pct)
+                shares = config.affordable_shares(allocation, entry_price, self._date_str(panel_dates[idx]))
+                entry_value = config.cash_value(shares, entry_price, "buy", self._date_str(panel_dates[idx]))
                 if shares <= 0:
                     _count("buy_lot_size")
                     continue

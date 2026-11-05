@@ -42,6 +42,7 @@ import polars as pl
 from app.market_time import CN_TZ, cn_now, cn_today
 from app.parquet import scan_daily_parquet
 from app.services.fs_utils import atomic_write_text
+from app.trading_costs import FeePolicy
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +52,7 @@ PAPER_LOCK = threading.RLock()
 # 费用默认值 — 与回测 engine.py 一致
 DEFAULT_COMMISSION_PCT = 0.00025   # 双边佣金 万2.5
 MIN_COMMISSION = 5.0               # 佣金最低 5 元
-DEFAULT_STAMP_TAX_PCT = 0.001      # 印花税, 仅卖出
+DEFAULT_STAMP_TAX_PCT = None       # 按成交日期选择股票卖出印花税
 DEFAULT_SLIPPAGE_BPS = 5.0         # 滑点 (bps, 万分之5)
 
 MAX_POSTPONE_DAYS = 3             # 顺延上限: 连续 N 个交易日无法成交自动过期
@@ -163,9 +164,10 @@ def create_account(
     account_id: str = DEFAULT_ACCOUNT_ID,
     name: str | None = None,
     commission_pct: float = DEFAULT_COMMISSION_PCT,
-    stamp_tax_pct: float = DEFAULT_STAMP_TAX_PCT,
+    stamp_tax_pct: float | None = DEFAULT_STAMP_TAX_PCT,
     slippage_bps: float = DEFAULT_SLIPPAGE_BPS,
     queue_limit_orders: bool = False,
+    fee_model: str = "ashare_v1",
 ) -> dict:
     """创建账户 (同 id 已存在则原样返回, 不覆盖 — 幂等)。"""
     validate_account_id(account_id)
@@ -175,13 +177,17 @@ def create_account(
             return existing
         if isinstance(initial_cash, bool) or not isinstance(initial_cash, (int, float)) or initial_cash <= 0:
             raise ValueError("初始资金必须是正数")
+        if fee_model not in ("legacy", "ashare_v1"):
+            raise ValueError("Unknown fee_model")
+        FeePolicy(commission_pct=commission_pct, stamp_tax_pct=stamp_tax_pct, slippage_bps=slippage_bps)
         acc = {
             "id": account_id,
             "name": (name or "").strip() or account_id,
             "initial_cash": float(initial_cash),
             "cash": float(initial_cash),
             "commission_pct": float(commission_pct),
-            "stamp_tax_pct": float(stamp_tax_pct),
+            "stamp_tax_pct": float(stamp_tax_pct) if stamp_tax_pct is not None else None,
+            "fee_model": fee_model,
             "slippage_bps": float(slippage_bps),
             "queue_limit_orders": bool(queue_limit_orders),
             "status": "active",  # active / frozen
@@ -244,6 +250,12 @@ def update_settings(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID, **fiel
             raise ValueError("尚未创建模拟账户")
         if "queue_limit_orders" in fields and fields["queue_limit_orders"] is not None:
             acc["queue_limit_orders"] = bool(fields["queue_limit_orders"])
+        if "stamp_tax_pct" in fields and fields["stamp_tax_pct"] is None:
+            acc["stamp_tax_pct"] = None
+        if "fee_model" in fields:
+            if fields["fee_model"] not in ("legacy", "ashare_v1"):
+                raise ValueError("Unknown fee_model")
+            acc["fee_model"] = fields["fee_model"]
         for key, lo, hi in (
             ("commission_pct", 0.0, 0.01),    # 佣金率 ≤1% (100‱)
             ("stamp_tax_pct", 0.0, 0.05),     # 印花税 ≤5% (仅卖出)
@@ -301,6 +313,16 @@ def buy_fee(qty: int, price: float, commission_pct: float) -> float:
 
 def sell_fee(qty: int, price: float, commission_pct: float, stamp_tax_pct: float) -> float:
     return round(max(qty * price * commission_pct, MIN_COMMISSION) + qty * price * stamp_tax_pct, 2)
+
+
+def _account_fee(acc: dict, qty: int, price: float, side: str, day: str, asset_type: str) -> float:
+    if acc.get("fee_model", "legacy") == "ashare_v1":
+        return FeePolicy(commission_pct=acc["commission_pct"], stamp_tax_pct=acc["stamp_tax_pct"]).charge(
+            qty, price, side, _date.fromisoformat(day), asset_type,
+        ).total
+    if side == "buy":
+        return buy_fee(qty, price, acc["commission_pct"])
+    return sell_fee(qty, price, acc["commission_pct"], acc.get("stamp_tax_pct") or 0.0)
 
 
 # ── 涨跌停 (纯函数, 金融口径须测试) ─────────────────────
@@ -420,7 +442,8 @@ def create_order(
         if side == "buy":
             # 买入资金预检 (按参考价上界估算, 撮合时二次校验)
             est_price = float(ref_price) if ref_price else 0.0
-            if est_price > 0 and qty * est_price * (1 + acc["slippage_bps"] / 10000) + buy_fee(qty, est_price, acc["commission_pct"]) > acc_cash:
+            executed = apply_slippage(est_price, "buy", acc["slippage_bps"]) if est_price > 0 else 0
+            if est_price > 0 and qty * executed + _account_fee(acc, qty, executed, "buy", cn_today().isoformat(), asset_type) > acc_cash:
                 return None, f"可用资金不足 (需约 {qty * est_price:.0f}, 可用 {acc_cash:.0f})"
         else:
             held = sell_capacity(data_dir, symbol, account_id)
@@ -664,7 +687,7 @@ def _fill_order(data_dir: Path, order: dict, raw_price: float, day: str, account
             _queue_or_expire(data_dir, order, acc, f"触及跌停 {down} 卖不出 (模拟)", account_id)
             return None
 
-    fee = buy_fee(qty, price, acc["commission_pct"]) if side == "buy" else sell_fee(qty, price, acc["commission_pct"], acc["stamp_tax_pct"])
+    fee = _account_fee(acc, qty, price, side, day, asset_type)
     gross = qty * price
     if side == "buy":
         if gross + fee > float(acc["cash"]) + 1e-6:

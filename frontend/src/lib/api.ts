@@ -1166,7 +1166,7 @@ export interface PaperAccount {
   initial_cash: number
   cash: number
   commission_pct: number
-  stamp_tax_pct: number
+  stamp_tax_pct: number | null
   slippage_bps: number
   queue_limit_orders?: boolean
   status: 'active' | 'frozen'
@@ -1190,7 +1190,7 @@ export interface PaperCompareRow {
   name: string
   status: 'active' | 'frozen'
   initial_cash: number
-  fees: { commission_pct: number; stamp_tax_pct: number; slippage_bps: number }
+  fees: { commission_pct: number; stamp_tax_pct: number | null; slippage_bps: number; fee_model?: 'legacy' | 'ashare_v1' }
   total: number
   cash: number
   market_value: number
@@ -1275,7 +1275,7 @@ export interface PaperOverview {
   initial_cash?: number
   estimating?: boolean
   holdings?: PaperHolding[]
-  fees?: { commission_pct: number; stamp_tax_pct: number; slippage_bps: number }
+  fees?: { commission_pct: number; stamp_tax_pct: number | null; slippage_bps: number; fee_model?: 'legacy' | 'ashare_v1' }
 }
 
 export interface PaperOrder {
@@ -3918,7 +3918,8 @@ export const api = {
     exit_fill?: 'close_t' | 'open_t+1' | 'signal_next_minute' | null
     fees_pct?: number
     commission_pct?: number
-    stamp_tax_pct?: number
+    stamp_tax_pct?: number | null
+    fee_model?: 'legacy' | 'ashare_v1'
     slippage_bps?: number
     max_positions?: number
     initial_capital?: number
@@ -4836,13 +4837,13 @@ export const api = {
   paperOverview: (account?: string) =>
     request<PaperOverview>(accUrl('/api/paper/overview', account)),
 
-  paperCreateAccount: (body: { initial_cash: number; account_id?: string; name?: string; commission_pct?: number; stamp_tax_pct?: number; slippage_bps?: number; queue_limit_orders?: boolean }) =>
+  paperCreateAccount: (body: { initial_cash: number; account_id?: string; name?: string; commission_pct?: number; stamp_tax_pct?: number | null; fee_model?: 'legacy' | 'ashare_v1'; slippage_bps?: number; queue_limit_orders?: boolean }) =>
     request<{ account: PaperAccount }>('/api/paper/account', {
       method: 'POST',
       body: JSON.stringify(body),
     }),
 
-  paperSettings: (body: { queue_limit_orders?: boolean; commission_pct?: number; stamp_tax_pct?: number; slippage_bps?: number }, account?: string) =>
+  paperSettings: (body: { queue_limit_orders?: boolean; commission_pct?: number; stamp_tax_pct?: number | null; fee_model?: 'legacy' | 'ashare_v1'; slippage_bps?: number }, account?: string) =>
     request<{ account: PaperAccount }>(accUrl('/api/paper/settings', account), {
       method: 'POST',
       body: JSON.stringify(body),
@@ -4903,7 +4904,7 @@ export const api = {
     request<{ ok: boolean }>(accUrl(`/api/paper/auto_rules/${encodeURIComponent(id)}`, account), { method: 'DELETE' }),
 
   /** 对比批量创建: 同本金/同费率一次开 N 个账户, 各绑一条自动跟单规则 */
-  paperArenaCreate: (body: { initial_cash: number; sources: PaperArenaSource[]; name_prefix?: string; commission_pct?: number; stamp_tax_pct?: number; slippage_bps?: number }) =>
+  paperArenaCreate: (body: { initial_cash: number; sources: PaperArenaSource[]; name_prefix?: string; commission_pct?: number; stamp_tax_pct?: number | null; fee_model?: 'legacy' | 'ashare_v1'; slippage_bps?: number }) =>
     request<{ created: Array<{ account: string; name: string; rule_id: string }> }>('/api/paper/arena/batch_create', {
       method: 'POST',
       body: JSON.stringify(body),

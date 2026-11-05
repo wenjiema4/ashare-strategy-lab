@@ -989,8 +989,9 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
   const [exitFill, setExitFill] = useState<'close_t' | 'open_t+1' | 'signal_next_minute'>(
     saved ? (saved.exitFill ?? saved.matching ?? 'close_t') : 'open_t+1',
   )
-  const [fees, setFees] = useState(saved?.fees ?? '2')
-  const [stampTax, setStampTax] = useState(saved?.stampTax ?? '1')
+  const [feeModel, setFeeModel] = useState<'legacy' | 'ashare_v1'>(saved?.feeModel ?? 'legacy')
+  const [fees, setFees] = useState(saved?.fees ?? '2.5')
+  const [stampTax, setStampTax] = useState(saved?.stampTax ?? (saved ? '1' : '0.5'))
   const [slippage, setSlippage] = useState(saved?.slippage ?? '5')
   const [maxPositions, setMaxPositions] = useState(saved?.maxPositions ?? '10')
   const [maxExposure, setMaxExposure] = useState(saved?.maxExposure ?? '100')
@@ -1048,8 +1049,9 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
     if (cfg.exit_fill === 'close_t' || cfg.exit_fill === 'open_t+1' || cfg.exit_fill === 'signal_next_minute') {
       setExitFill(cfg.exit_fill)
     }
-    if (cfg.commission_pct != null) setFees(String(Math.round(Number(cfg.commission_pct) * 10000)))
-    if (cfg.stamp_tax_pct != null) setStampTax(String(Number(cfg.stamp_tax_pct) * 1000))
+    if (cfg.commission_pct != null) setFees(String(Number(cfg.commission_pct) * 10000))
+    setFeeModel(cfg.fee_model === 'ashare_v1' ? 'ashare_v1' : 'legacy')
+    setStampTax(cfg.stamp_tax_pct != null ? String(Number(cfg.stamp_tax_pct) * 1000) : cfg.fee_model === 'ashare_v1' ? '' : '0')
     if (cfg.slippage_bps != null) setSlippage(String(cfg.slippage_bps))
     if (cfg.max_positions != null) setMaxPositions(String(cfg.max_positions))
     if (cfg.max_exposure_pct != null) setMaxExposure(String(Math.round(Number(cfg.max_exposure_pct) * 100)))
@@ -1225,6 +1227,7 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
         exitFill,
         fees,
         stampTax,
+        feeModel,
         slippage,
         maxPositions,
         maxExposure,
@@ -1262,7 +1265,8 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
       entry_fill: entryFill,
       exit_fill: exitFill,
       commission_pct: Number(fees) / 10000,
-      stamp_tax_pct: Number(stampTax) / 1000,
+      stamp_tax_pct: stampTax.trim() === '' ? null : Number(stampTax) / 1000,
+      fee_model: feeModel,
       slippage_bps: Number(slippage),
       max_positions: Number(maxPositions),
       max_exposure_pct: Number(maxExposure) / 100,
@@ -2099,6 +2103,14 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
         </div>
         )}
         {simMode === 'position' && (
+        <div className="space-y-2">
+        <p className="text-[10px] text-muted">金额模型仅支持2022-04-29起、已验证未复权的执行价；复权行情请用比例费用。{feeModel === 'ashare_v1' ? '印花税留空按成交日。' : '原比例模式印花税留空为0。'}</p>
+        <label className="text-[10px] text-secondary block">费用模型
+          <select value={feeModel} onChange={e => setFeeModel(e.target.value as 'legacy' | 'ashare_v1')} className={INPUT_CLS}>
+            <option value="ashare_v1">A股金额费用（需验证原始价，最低佣金5元）</option>
+            <option value="legacy">原比例费用（兼容历史回测）</option>
+          </select>
+        </label>
         <div className="grid grid-cols-3 gap-2">
           <div>
             <label className="text-[10px] font-medium text-secondary block mb-1">佣金 ‱</label>
@@ -2106,12 +2118,13 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
           </div>
           <div>
             <label className="text-[10px] font-medium text-secondary block mb-1">印花税 ‰</label>
-            <input type="number" min={0} value={stampTax} onChange={e => setStampTax(e.target.value)} className={INPUT_CLS} />
+            <input type="number" min={0} placeholder={feeModel === 'ashare_v1' ? '按成交日' : '0'} value={stampTax} onChange={e => setStampTax(e.target.value)} className={INPUT_CLS} />
           </div>
           <div>
             <label className="text-[10px] font-medium text-secondary block mb-1">滑点 ‱</label>
             <input type="number" min={0} value={slippage} onChange={e => setSlippage(e.target.value)} className={INPUT_CLS} />
           </div>
+        </div>
         </div>
         )}
         {simMode === 'position' && (

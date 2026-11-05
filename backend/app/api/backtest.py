@@ -361,6 +361,7 @@ class StrategyBacktestRequest(BaseModel):
     fees_pct: float = 0.0002
     commission_pct: float | None = None
     stamp_tax_pct: float | None = None
+    fee_model: Literal["legacy", "ashare_v1"] = "legacy"
     slippage_bps: float = 5.0
     max_positions: int = 10
     max_exposure_pct: float = 1.0
@@ -433,6 +434,7 @@ def strategy_run(req: StrategyBacktestRequest, request: Request):
         fees_pct=req.fees_pct,
         commission_pct=req.commission_pct,
         stamp_tax_pct=req.stamp_tax_pct,
+        fee_model=req.fee_model,
         slippage_bps=req.slippage_bps,
         max_positions=req.max_positions,
         max_exposure_pct=req.max_exposure_pct,
@@ -631,8 +633,9 @@ def _make_job_key(
     position_policy: str | None = None,
     position_policy_params: str | None = None,
     force: bool = False,
+    fee_model: str = "legacy",
 ) -> str:
-    raw = f"{strategy_id}|{symbols}|{start}|{end}|{matching}|{entry_fill}|{exit_fill}|{fees_pct}|{slippage_bps}|{max_positions}|{max_exposure_pct}|{initial_capital}|{position_sizing}|{params}|{overrides}|{mode}|{holding_days}|{commission_pct}|{stamp_tax_pct}|{asset_type}|{minute_fill}|{regime_filter}|{position_policy}|{position_policy_params}|force={force}"
+    raw = f"{strategy_id}|{symbols}|{start}|{end}|{matching}|{entry_fill}|{exit_fill}|{fees_pct}|{slippage_bps}|{max_positions}|{max_exposure_pct}|{initial_capital}|{position_sizing}|{params}|{overrides}|{mode}|{holding_days}|{commission_pct}|{stamp_tax_pct}|{asset_type}|{minute_fill}|{regime_filter}|{position_policy}|{position_policy_params}|force={force}|fee_model={fee_model}"
     return hashlib.md5(raw.encode()).hexdigest()[:12]
 
 
@@ -649,6 +652,7 @@ async def strategy_stream(
     fees_pct: float = 0.0002,
     commission_pct: float | None = None,
     stamp_tax_pct: float | None = None,
+    fee_model: Literal["legacy", "ashare_v1"] = "legacy",
     slippage_bps: float = 5.0,
     max_positions: int = 10,
     max_exposure_pct: float = 1.0,
@@ -713,6 +717,7 @@ async def strategy_stream(
         position_policy=position_policy,
         position_policy_params=position_policy_params,
         force=force,
+        fee_model=fee_model,
     )
 
     _cleanup_stale_jobs()
@@ -766,6 +771,7 @@ async def strategy_stream(
                 fees_pct=fees_pct,
                 commission_pct=commission_pct,
                 stamp_tax_pct=stamp_tax_pct,
+                fee_model=fee_model,
                 slippage_bps=slippage_bps,
                 max_positions=int(max_positions),
                 max_exposure_pct=float(max_exposure_pct),
@@ -889,6 +895,7 @@ async def strategy_cancel(request: Request):
         int(_get("holding_days", "5")),
         commission_pct=_get_opt_float("commission_pct"),
         stamp_tax_pct=_get_opt_float("stamp_tax_pct"),
+        fee_model=_get("fee_model", "legacy"),
         asset_type=_get("asset_type", "stock"),
         minute_fill=_get_opt_bool("minute_fill"),
         regime_filter=_get("regime_filter") or None,
@@ -927,7 +934,7 @@ def _json_safe(obj):
 _OPT_BT_FIELDS = [
     "matching", "fees_pct", "commission_pct", "stamp_tax_pct", "slippage_bps",
     "max_positions", "max_exposure_pct", "initial_capital", "position_sizing",
-    "mode", "holding_days",
+    "mode", "holding_days", "fee_model",
 ]
 
 
@@ -954,12 +961,14 @@ def _make_opt_job_key(
 def _opt_backtest_kwargs(
     matching, fees_pct, commission_pct, stamp_tax_pct, slippage_bps,
     max_positions, max_exposure_pct, initial_capital, position_sizing, mode, holding_days,
+    fee_model="legacy",
 ) -> dict:
     return {
         "matching": matching,
         "fees_pct": fees_pct,
         "commission_pct": commission_pct,
         "stamp_tax_pct": stamp_tax_pct,
+        "fee_model": fee_model,
         "slippage_bps": slippage_bps,
         "max_positions": int(max_positions),
         "max_exposure_pct": float(max_exposure_pct),
@@ -1065,6 +1074,7 @@ async def optimize_robust_stream(
     fees_pct: float = 0.0002,
     commission_pct: float | None = None,
     stamp_tax_pct: float | None = None,
+    fee_model: Literal["legacy", "ashare_v1"] = "legacy",
     slippage_bps: float = 5.0,
     max_positions: int = 10,
     max_exposure_pct: float = 1.0,
@@ -1111,6 +1121,7 @@ async def optimize_robust_stream(
     bt_kwargs = _opt_backtest_kwargs(
         matching, fees_pct, commission_pct, stamp_tax_pct, slippage_bps,
         max_positions, max_exposure_pct, initial_capital, position_sizing, mode, holding_days,
+        fee_model=fee_model,
     )
     bt_sig = "|".join(f"{k}={bt_kwargs[k]}" for k in _OPT_BT_FIELDS)
     job_key = "robust:" + _make_opt_job_key(
@@ -1262,6 +1273,7 @@ async def walkforward_stream(
     fees_pct: float = 0.0002,
     commission_pct: float | None = None,
     stamp_tax_pct: float | None = None,
+    fee_model: Literal["legacy", "ashare_v1"] = "legacy",
     slippage_bps: float = 5.0,
     max_positions: int = 10,
     max_exposure_pct: float = 1.0,
@@ -1299,6 +1311,7 @@ async def walkforward_stream(
     bt_kwargs = _opt_backtest_kwargs(
         matching, fees_pct, commission_pct, stamp_tax_pct, slippage_bps,
         max_positions, max_exposure_pct, initial_capital, position_sizing, mode, holding_days,
+        fee_model=fee_model,
     )
     bt_sig = "|".join(f"{k}={bt_kwargs[k]}" for k in _OPT_BT_FIELDS)
     windows = f"{train_days}/{test_days}/{step_days}"

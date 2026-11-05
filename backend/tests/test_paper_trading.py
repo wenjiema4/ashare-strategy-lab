@@ -163,7 +163,7 @@ def test_immediate_fill_cash_and_positions_consistent(tmp_path, monkeypatch):
     filled = paper.get_order(tmp_path, order["id"])
     # 滑点向上: 10 * 1.0005
     assert filled["fill_price"] == pytest.approx(10.005)
-    fee = paper.buy_fee(1000, 10.005, paper.DEFAULT_COMMISSION_PCT)
+    fee = 5.10  # 最低佣金5元 + 股票过户费0.10元
     assert filled["fees"] == pytest.approx(fee)
 
     positions, cash = paper.replay_positions(tmp_path)

@@ -20,7 +20,7 @@ from app.strategy.scoring import effective_scoring, effective_scoring_directions
 
 DIFFERENCES = [
     "日线买卖点在收盘数据确认后评估，委托交给原模拟仓按次日开盘撮合；不回填历史信号。",
-    "模拟仓佣金最低 5 元，回测无此下限；同费率不保证同成本、同收益。",
+    "原比例回测无最低佣金；金额模型包含最低佣金和过户费，但要求执行价未复权。",
     "仓位按委托时权益与参考价确定，次日跳空、可卖资金、涨跌停和顺延会造成成交及仓位差异。",
     "保护性风控按新鲜实时快照检查，无法重放两次快照之间的价格路径；次日开盘单沿用原模拟仓盘后记账。",
     "回测期末强制平仓不用于持续运行的模拟仓。历史报告未保存代码版本时，只能核对当前策略定义。",
@@ -125,6 +125,7 @@ def make_snapshot(data_dir: Path, engine, source: dict, account: dict | None = N
     if current and account:
         raw.update(
             initial_capital=account["initial_cash"],
+            fee_model=account.get("fee_model", "legacy"),
             **{k: account[k] for k in ("commission_pct", "stamp_tax_pct", "slippage_bps")},
         )
     sid = raw.get("strategy_id") or source.get("strategy_id")
@@ -236,11 +237,18 @@ def make_snapshot(data_dir: Path, engine, source: dict, account: dict | None = N
         if fees["commission_pct"] is not None
         else raw.get("fees_pct", 0.0002)
     )
-    fees["stamp_tax_pct"] = fees["stamp_tax_pct"] if fees["stamp_tax_pct"] is not None else 0.0
+    fee_model = raw.get("fee_model", "legacy")
+    if fee_model not in ("legacy", "ashare_v1"):
+        raise ValueError("Unknown fee_model")
+    if fee_model == "legacy" and fees["stamp_tax_pct"] is None:
+        fees["stamp_tax_pct"] = 0.0
     for key, value in fees.items():
+        if value is None and key == "stamp_tax_pct":
+            continue
         number(
             value, key, 0, {"slippage_bps": 200, "commission_pct": 0.01, "stamp_tax_pct": 0.05}[key]
         )
+    fees["fee_model"] = fee_model
     # 复用资源依赖闭包，不另写策略/因子/信号解析器。额外加入冻结覆盖配置引用。
     roots = [{"kind": "strategy", "id": sid}]
     catalog = definitions.catalog(data_dir)

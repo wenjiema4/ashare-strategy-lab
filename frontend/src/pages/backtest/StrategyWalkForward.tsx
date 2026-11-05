@@ -84,6 +84,7 @@ export function StrategyWalkForward() {
   const [start, setStart] = useState(THREE_YEARS_AGO)
   const [end, setEnd] = useState(TODAY)
   const [mode, setMode] = useState<'position' | 'full'>('position')
+  const [feeModel, setFeeModel] = useState<'legacy' | 'ashare_v1'>('legacy')
   const [trainDays, setTrainDays] = useState('252')
   const [testDays, setTestDays] = useState('63')
   const [stepDays, setStepDays] = useState('63')
@@ -124,6 +125,10 @@ export function StrategyWalkForward() {
       start,
       end,
       mode,
+      fee_model: feeModel,
+      commission_pct: feeModel === 'ashare_v1' ? 0.00025 : 0.0002,
+      stamp_tax_pct: null,
+      slippage_bps: 5,
     })
   }
 
@@ -162,6 +167,13 @@ export function StrategyWalkForward() {
           <StrategySelect strategies={strategies} value={sweep.strategyId} onChange={sweep.selectStrategy} />
         </div>
 
+        <label className="block text-xs text-secondary">费用模型
+          <select value={feeModel} onChange={e => setFeeModel(e.target.value as 'legacy' | 'ashare_v1')} className={INPUT_CLS}>
+            <option value="ashare_v1">A股金额费用 · 佣金万2.5 · 滑点5bp</option>
+            <option value="legacy">原比例费用 · 佣金万2 · 滑点5bp</option>
+          </select>
+          <span className="mt-1 block text-[10px] text-muted">金额模型需2022-04-29起且原始价已验证；复权行情请用比例费用。</span>
+        </label>
         <div>
           <label className="mb-1.5 block text-xs font-medium text-secondary">优化目标</label>
           <select value={objective} onChange={e => setObjective(e.target.value)} className={INPUT_CLS}>

@@ -637,6 +637,7 @@ class StrategyBacktestConfig:
     fees_pct: float = 0.0002
     commission_pct: float | None = None
     stamp_tax_pct: float | None = None
+    fee_model: Literal["legacy", "ashare_v1"] = "legacy"
     slippage_bps: float = 5.0
     max_positions: int = 10
     max_exposure_pct: float = 1.0
@@ -1611,6 +1612,7 @@ class StrategyBacktestService:
             fees_pct=config.fees_pct,
             commission_pct=config.commission_pct,
             stamp_tax_pct=config.stamp_tax_pct,
+            fee_model=config.fee_model,
             slippage_bps=config.slippage_bps,
             stop_loss_pct=stop_loss,
             take_profit_pct=take_profit,
@@ -2281,6 +2283,7 @@ class StrategyBacktestService:
             fees_pct=config.fees_pct,
             commission_pct=config.commission_pct,
             stamp_tax_pct=config.stamp_tax_pct,
+            fee_model=config.fee_model,
             slippage_bps=config.slippage_bps,
             stop_loss_pct=stop_loss,
             take_profit_pct=take_profit,
@@ -3028,6 +3031,7 @@ class StrategyBacktestService:
             "fees_pct": c.fees_pct,
             "commission_pct": c.commission_pct,
             "stamp_tax_pct": c.stamp_tax_pct,
+            "fee_model": c.fee_model,
             "slippage_bps": c.slippage_bps,
             "max_positions": c.max_positions,
             "max_exposure_pct": c.max_exposure_pct,

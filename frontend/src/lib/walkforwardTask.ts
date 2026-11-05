@@ -66,6 +66,10 @@ export interface StartWalkForwardParams {
   start?: string | null
   end?: string | null
   mode?: 'position' | 'full'
+  fee_model?: 'legacy' | 'ashare_v1'
+  commission_pct?: number
+  stamp_tax_pct?: number | null
+  slippage_bps?: number
 }
 
 let current: WalkForwardTask | null = null
@@ -231,6 +235,10 @@ export function startWalkForward(params: StartWalkForwardParams): void {
     start: params.start ?? undefined,
     end: params.end ?? undefined,
     mode: params.mode,
+    fee_model: params.fee_model,
+    commission_pct: params.commission_pct,
+    stamp_tax_pct: params.stamp_tax_pct,
+    slippage_bps: params.slippage_bps,
   })
 
   localStorage.setItem(RECONNECT_KEY, qs)

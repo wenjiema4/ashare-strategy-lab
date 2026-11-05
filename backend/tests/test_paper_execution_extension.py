@@ -7,6 +7,7 @@ import polars as pl
 import pytest
 
 from app.custom.paper_execution.service import ExecutionService
+from app.custom.paper_execution.snapshot import digest
 from app.market_time import CN_TZ
 from app.strategy import config, paper, paper_auto
 from app.strategy.engine import StrategyDataContext, StrategyEngine
@@ -318,6 +319,36 @@ def test_fee_drift_and_manual_orders_pause_only_managed_account(env):
         env.root, "000001.SZ", "buy", account_id="manual", qty=100, ref_price=10.0
     )
     assert error is None
+
+
+def test_old_frozen_snapshot_detects_fee_model_change(env):
+    bind(env, fee_model="legacy")
+    state = env.service._load("default")
+    state["snapshot"]["fees"].pop("fee_model")
+    state["revision"] = digest(state["snapshot"])
+    env.service._save(state)
+    paper.update_settings(env.root, fee_model="ashare_v1")
+    env.service.tick(NOW)
+    assert env.service.get("default")["status"] == "blocked"
+    assert paper.load_orders(env.root) == []
+
+
+def test_execution_budget_and_reservation_include_cash_fees(env):
+    assert env.service._reserved(
+        {"qty": 10000, "ref_price": 10.0, "asset_type": "stock"},
+        {"fee_model": "ashare_v1", "commission_pct": 0.00025, "stamp_tax_pct": None, "slippage_bps": 0},
+    ) == 100026.0
+
+
+def test_execution_can_spend_exact_one_lot_budget(env):
+    paper.update_settings(env.root, slippage_bps=0)
+    bind(env, fee_model="ashare_v1", initial_capital=100_000,
+         max_exposure_pct=0.0100501, max_positions=1,
+         commission_pct=0.00025, slippage_bps=0)
+    env.service.tick(NOW)
+    orders = paper.load_orders(env.root)
+    assert len(orders) == 1
+    assert orders[0]["qty"] == 100
 
 
 def test_newer_or_corrupt_state_is_not_executed(env):

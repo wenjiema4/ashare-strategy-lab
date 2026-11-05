@@ -165,6 +165,7 @@ export const storage = {
     exitFill: 'close_t' | 'open_t+1' | 'signal_next_minute'
     fees: string
     stampTax?: string
+    feeModel?: 'legacy' | 'ashare_v1'
     slippage: string
     maxPositions: string
     maxExposure: string

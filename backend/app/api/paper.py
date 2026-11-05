@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import uuid
 from pathlib import Path
+from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
@@ -37,9 +38,10 @@ class AccountModel(BaseModel):
     account_id: str = paper.DEFAULT_ACCOUNT_ID
     name: str | None = None
     commission_pct: float = paper.DEFAULT_COMMISSION_PCT
-    stamp_tax_pct: float = paper.DEFAULT_STAMP_TAX_PCT
+    stamp_tax_pct: float | None = paper.DEFAULT_STAMP_TAX_PCT
     slippage_bps: float = paper.DEFAULT_SLIPPAGE_BPS
     queue_limit_orders: bool = False
+    fee_model: Literal["legacy", "ashare_v1"] = "ashare_v1"
 
 
 class OrderModel(BaseModel):
@@ -52,6 +54,7 @@ class OrderModel(BaseModel):
 
 
 class SettingsModel(BaseModel):
+    fee_model: Literal["legacy", "ashare_v1"] | None = None
     queue_limit_orders: bool | None = None
     commission_pct: float | None = None   # 佣金率 (0.00025 = 万2.5)
     stamp_tax_pct: float | None = None    # 印花税 (0.001 = 千1, 仅卖出)
@@ -114,6 +117,7 @@ def create_account(request: Request, body: AccountModel):
             stamp_tax_pct=body.stamp_tax_pct,
             slippage_bps=body.slippage_bps,
             queue_limit_orders=body.queue_limit_orders,
+            fee_model=body.fee_model,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -146,6 +150,7 @@ def overview(request: Request, account: str = Query(paper.DEFAULT_ACCOUNT_ID)):
         return {"initialized": False, "account_id": acc_id}
     ov = paper.overview(data_dir, account_id=acc_id)
     ov["fees"] = {k: acc[k] for k in ("commission_pct", "stamp_tax_pct", "slippage_bps")}
+    ov["fees"]["fee_model"] = acc.get("fee_model", "legacy")
 
     # 盘中实时估算: 从行情服务的当日 enriched 快照取 raw_close (软失败, 降级日线)
     qs = getattr(request.app.state, "quote_service", None)
@@ -287,7 +292,10 @@ def compare_accounts(request: Request):
             "name": acc.get("name") or acc_id,
             "status": acc.get("status"),
             "initial_cash": initial,
-            "fees": {k: acc.get(k) for k in ("commission_pct", "stamp_tax_pct", "slippage_bps")},
+            "fees": {
+                **{k: acc.get(k) for k in ("commission_pct", "stamp_tax_pct", "slippage_bps")},
+                "fee_model": acc.get("fee_model", "legacy"),
+            },
             "total": ov.get("total"),
             "cash": ov.get("cash"),
             "market_value": ov.get("market_value"),
@@ -344,7 +352,7 @@ def freeze(request: Request, frozen: bool = True, account: str = Query(paper.DEF
 def update_settings(request: Request, body: SettingsModel, account: str = Query(paper.DEFAULT_ACCOUNT_ID)):
     """更新账户设置 (涨跌停排队等开关)。"""
     try:
-        acc = paper.update_settings(_data_dir(request), _acc(request, account), **body.model_dump())
+        acc = paper.update_settings(_data_dir(request), _acc(request, account), **body.model_dump(exclude_unset=True))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return {"account": acc}
@@ -418,9 +426,10 @@ class ArenaBatchModel(BaseModel):
     sources: list[ArenaSourceModel]
     name_prefix: str = ""                # 账户名前缀 (如 "第一期-", 可空)
     commission_pct: float = paper.DEFAULT_COMMISSION_PCT
-    stamp_tax_pct: float = paper.DEFAULT_STAMP_TAX_PCT
+    stamp_tax_pct: float | None = paper.DEFAULT_STAMP_TAX_PCT
     slippage_bps: float = paper.DEFAULT_SLIPPAGE_BPS
     queue_limit_orders: bool = False
+    fee_model: Literal["legacy", "ashare_v1"] = "ashare_v1"
 
 
 @router.post("/arena/batch_create")
@@ -471,6 +480,7 @@ def arena_batch_create(request: Request, body: ArenaBatchModel):
                 stamp_tax_pct=body.stamp_tax_pct,
                 slippage_bps=body.slippage_bps,
                 queue_limit_orders=body.queue_limit_orders,
+                fee_model=body.fee_model,
             )
             saved = paper_auto.create_auto_rule(data_dir, rule, account_id=account_id)
             created.append({"account": account_id, "name": acc_name, "rule_id": saved["id"]})

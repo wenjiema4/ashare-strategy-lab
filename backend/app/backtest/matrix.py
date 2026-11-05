@@ -441,6 +441,7 @@ class MarketDataMatrix:
     limit_up_locked: np.ndarray
     limit_down_locked: np.ndarray
     fields: Mapping[str, np.ndarray]
+    cash_prices_raw: bool = False
     cache_status: str = "memory"
     cache_path: str | None = None
     cache_lease: Any | None = field(default=None, compare=False, repr=False)
@@ -556,6 +557,7 @@ class MarketMatrix:
     # 逐格入场价覆盖 (time x asset, NaN=回退 open/close 惯例)。分钟策略回测用:
     # 信号在盘中第 m 根触发, 入场价 = 触发分钟收盘价, 而非当日开盘/收盘。
     entry_price: np.ndarray | None = None
+    cash_prices_raw: bool = False
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -676,7 +678,26 @@ def build_market_data_matrix(
         limit_up_locked=limit_up_locked,
         limit_down_locked=limit_down_locked,
         fields=MappingProxyType(fields),
+        cash_prices_raw=panel_has_raw_cash_prices(panel),
     )
+
+
+def panel_has_raw_cash_prices(panel: pl.DataFrame) -> bool:
+    """Cash lots require raw evidence; adjusted prices need corporate-action accounting."""
+    if "raw_close" not in panel.columns or "close" not in panel.columns:
+        return False
+    close = panel["close"].cast(pl.Float64, strict=False).to_numpy()
+    raw = panel["raw_close"].cast(pl.Float64, strict=False).to_numpy()
+    present = np.zeros(len(panel), dtype=bool)
+    for column in ("open", "high", "low", "close"):
+        if column in panel.columns:
+            prices = panel[column].cast(pl.Float64, strict=False).to_numpy()
+            present |= np.isfinite(prices) & (prices > 0)
+    return bool(present.any() and np.all(
+        np.isfinite(close[present]) & (close[present] > 0)
+        & np.isfinite(raw[present]) & (raw[present] > 0)
+        & np.isclose(close[present], raw[present], rtol=1e-6, atol=1e-6)
+    ))
 
 
 def load_market_data_matrix_from_parquet(
@@ -2422,6 +2443,7 @@ def build_market_matrix_from_signals(
         session_ids=market.session_ids,
         symbols=market.symbols,
         names=market.names,
+        cash_prices_raw=market.cash_prices_raw,
         open=market.open,
         high=market.high,
         low=market.low,
@@ -2609,6 +2631,7 @@ def slice_market_data_matrix(market: MarketDataMatrix, start: int, stop: int) ->
         limit_up_locked=market.limit_up_locked[start:stop],
         limit_down_locked=market.limit_down_locked[start:stop],
         fields=MappingProxyType(fields),
+        cash_prices_raw=market.cash_prices_raw,
         cache_status=market.cache_status,
         cache_path=market.cache_path,
         cache_lease=market.cache_lease,

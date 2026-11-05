@@ -19,7 +19,7 @@ export interface ExecutionSnapshot {
   max_exposure_pct: number
   position_sizing: string
   initial_capital: number
-  fees: { commission_pct: number; stamp_tax_pct: number; slippage_bps: number }
+  fees: { commission_pct: number; stamp_tax_pct: number | null; slippage_bps: number; fee_model?: 'legacy' | 'ashare_v1' }
 }
 
 export interface ExecutionPreview {
