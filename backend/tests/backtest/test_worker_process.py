@@ -97,6 +97,50 @@ def _write_market_data(data_dir, start: date, days: int = 3) -> None:
     }).write_parquet(instruments_dir / "part.parquet")
 
 
+def _write_adjusted_worker_data(data_dir):
+    _write_worker_strategy(data_dir)
+    _write_market_data(data_dir, date(2023, 1, 2))
+    for path in (data_dir / "kline_daily_enriched").glob("*/*.parquet"):
+        frame = pl.read_parquet(path).with_columns((pl.col("close") * 2).alias("raw_close"))
+        frame.write_parquet(path)
+
+
+def test_raw_price_guard_survives_spawn_as_actionable_validation_error(tmp_path):
+    _write_adjusted_worker_data(tmp_path)
+    config = StrategyBacktestConfig(
+        strategy_id="worker_always_entry", start=date(2023, 1, 2), end=date(2023, 1, 4),
+        fee_model="ashare_v1", initial_capital=100000, symbols=None,
+        overrides={"basic_filter": {"enabled": False}},
+    )
+    with pytest.raises(BacktestWorkerError) as caught:
+        run_worker_task(make_worker_task("backtest", tmp_path, config))
+    assert getattr(caught.value, "code", None) == "raw_price_evidence_required"
+    assert "未复权" in str(caught.value)
+    assert "Traceback" not in str(caught.value)
+
+
+def test_strategy_api_rejects_adjusted_cash_backtest_without_server_error(tmp_path, monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from app.api.backtest import router
+    from app.config import settings
+
+    _write_adjusted_worker_data(tmp_path)
+    monkeypatch.setattr(settings, "data_dir", tmp_path)
+    app = FastAPI()
+    app.include_router(router)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post("/api/backtest/strategy/run", json={
+            "strategy_id": "worker_always_entry", "start": "2023-01-02", "end": "2023-01-04",
+            "fee_model": "ashare_v1", "initial_capital": 100000,
+            "overrides": {"basic_filter": {"enabled": False}},
+        })
+    assert response.status_code == 422, response.text
+    assert "未复权" in response.json()["detail"]
+    assert "Traceback" not in response.text
+
+
 def _write_mining_market_data(
     data_dir,
     start: date,

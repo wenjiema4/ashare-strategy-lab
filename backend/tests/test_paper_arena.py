@@ -8,10 +8,36 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.api.paper import router
+from app.strategy import paper
+
+
+@pytest.mark.parametrize("status", ["active", "frozen"])
+def test_compare_uses_settled_nav_instead_of_inventory_cost(tmp_path, status):
+    """Closing-price gains must survive with realtime quotes disabled."""
+    paper.create_account(tmp_path, 100000, commission_pct=0, stamp_tax_pct=0,
+                         slippage_bps=0, fee_model="legacy")
+    order, error = paper.create_order(tmp_path, "600000.SH", "buy", qty=100, ref_price=10)
+    assert error is None
+    paper._fill_order(tmp_path, order, 10, "2026-11-05")
+    paper._write_nav_line(tmp_path, "2026-11-05", {
+        "date": "2026-11-05", "cash": 98995, "mv": 1205, "nav": 100200,
+    })
+    account = paper.get_account(tmp_path)
+    account["status"] = status
+    paper.save_account(tmp_path, account)
+
+    row = _client(tmp_path).get("/api/paper/compare").json()["accounts"][0]
+    assert row["total"] == 100200
+    assert row["cash"] == 98995
+    assert row["market_value"] == 1205
+    assert row["total_pnl"] == 200
+    assert row["pnl_pct"] == 0.2
+    assert row["live_total"] is None
 
 
 def _client(tmp_path: Path) -> TestClient:

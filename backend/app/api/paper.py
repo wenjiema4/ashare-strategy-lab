@@ -272,6 +272,14 @@ def compare_accounts(request: Request):
         st = paper.stats(data_dir, acc_id)
         initial = float(acc.get("initial_cash") or 0)
         nav_rows = paper.load_nav(data_dir, acc_id)
+        # Table columns describe the last settlement; live estimates below use
+        # current holdings separately. Cost fallback loses unrealized P&L when
+        # quotes are disabled, especially for frozen historical replay accounts.
+        if nav_rows and all(key in nav_rows[-1] for key in ("nav", "cash", "mv")):
+            settled = nav_rows[-1]
+            ov = {**ov, "total": float(settled["nav"]),
+                  "cash": float(settled["cash"]), "market_value": float(settled["mv"]),
+                  "total_pnl": round(float(settled["nav"]) - initial, 2)}
         day_change_pct = None
         if len(nav_rows) >= 2 and float(nav_rows[-2]["nav"] or 0) > 0:
             day_change_pct = round((float(nav_rows[-1]["nav"]) / float(nav_rows[-2]["nav"]) - 1) * 100, 2)
