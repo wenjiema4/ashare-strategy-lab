@@ -404,7 +404,7 @@ def _guard_minute_strategy_backtest(
 def strategy_run(req: StrategyBacktestRequest, request: Request):
     """策略回测 — 复用 StrategyDef 体系做全周期回测。"""
     from app.backtest.strategy import StrategyBacktestConfig
-    from app.backtest.worker import make_worker_task, run_worker_task
+    from app.backtest.worker import BacktestValidationError, make_worker_task, run_worker_task
 
     end = req.end or cn_today()
     start = _resolve_start(req, end, FACTOR_DEFAULT_DAYS)
@@ -454,7 +454,10 @@ def strategy_run(req: StrategyBacktestRequest, request: Request):
     admit_request(request, COOKIE_NAME)
     with shared_heavy_job_limiter.slot("normal"):
         workload.record("backtest.task", "executed")
-        return _stamp_daily_data(run_worker_task(task))
+        try:
+            return _stamp_daily_data(run_worker_task(task))
+        except BacktestValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 # ── SSE 流式回测 (实时进度 + 可取消 + 支持重连) ───────────────────

@@ -30,7 +30,7 @@ from app.config import settings
 from app.enriched_generation import EnrichedGenerationUnavailableError
 from app.parquet import scan_enriched_parquet
 from app.tickflow.repository import KlineRepository
-from app.trading_costs import FeePolicy
+from app.trading_costs import FeePolicy, RawPriceEvidenceError
 
 logger = logging.getLogger(__name__)
 
@@ -1036,7 +1036,7 @@ class BacktestEngine:
         options: SimulationOptions | None = None,
     ) -> SimResult:
         if config.fee_model == "ashare_v1" and not matrix.cash_prices_raw:
-            raise ValueError("金额费用回测需要未复权原始价证据；复权持仓账本尚未启用，请使用原比例费用")
+            raise RawPriceEvidenceError()
         options = options or SimulationOptions()
         entry_prices = self._resolve_entry_prices(matrix, config)
         exit_prices = matrix.open if config.exit_fill == "open_t+1" else matrix.close
@@ -1410,7 +1410,7 @@ class BacktestEngine:
     ) -> SimResult:
         """全量候选独立执行：每个买入信号都是独立样本, 不受资金/仓位限制。"""
         if config.fee_model == "ashare_v1" and not panel_has_raw_cash_prices(panel):
-            raise ValueError("金额费用回测需要未复权原始价证据；复权持仓账本尚未启用，请使用原比例费用")
+            raise RawPriceEvidenceError()
         if panel.is_empty():
             return self._empty_result()
 
@@ -2023,7 +2023,7 @@ class BacktestEngine:
         options: SimulationOptions | None = None,
     ) -> SimResult:
         if config.fee_model == "ashare_v1" and not matrix.cash_prices_raw:
-            raise ValueError("金额费用回测需要未复权原始价证据；复权持仓账本尚未启用，请使用原比例费用")
+            raise RawPriceEvidenceError()
         options = options or SimulationOptions()
         time_count, asset_count = matrix.shape
         entry_prices = self._resolve_entry_prices(matrix, config)
@@ -2566,7 +2566,7 @@ class BacktestEngine:
     ) -> SimResult:
         """账户级组合回测：日线信号 → 成交约束 → 仓位/现金撮合。"""
         if config.fee_model == "ashare_v1" and not panel_has_raw_cash_prices(panel):
-            raise ValueError("金额费用回测需要未复权原始价证据；复权持仓账本尚未启用，请使用原比例费用")
+            raise RawPriceEvidenceError()
         if panel.is_empty():
             return self._empty_result()
 

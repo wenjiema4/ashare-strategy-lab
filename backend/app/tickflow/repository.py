@@ -1942,12 +1942,17 @@ class KlineRepository:
         start: date,
         end: date,
         asset_type: str = "stock",
+        *,
+        raw: bool = False,
     ) -> pl.DataFrame:
         """多 symbol × 日期范围的分钟K查询 (分钟K精确回测用)。
 
         一次 scan_parquet + predicate pushdown 读多只股票在 [start, end] 内的所有分钟K。
         返回列: symbol, datetime, open, high, low, close, volume, amount。
+        raw=True 仅在已迁移的原始基准下跳过复权投影；缺少基准明确拒绝。
         """
+        if raw and not minute_basis_is_raw(self.store.data_dir):
+            raise ValueError("分钟数据缺少未复权原始价基准，请先完成原始基准迁移")
         if not symbols:
             return pl.DataFrame()
         try:
@@ -1964,7 +1969,7 @@ class KlineRepository:
                 .sort(["symbol", "datetime"]),
                 streaming=True,
             )
-            return self._maybe_adjust_minute(df, asset_type)
+            return df if raw else self._maybe_adjust_minute(df, asset_type)
         except Exception as e:  # noqa: BLE001
             logger.warning("分钟K范围查询失败: %s", e)
             return pl.DataFrame()

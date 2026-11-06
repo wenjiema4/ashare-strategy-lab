@@ -21,8 +21,9 @@
   - 涨跌停: 触及涨停的买单 / 跌停的卖单默认拒单 (expired 留痕); 账户开启
     queue_limit_orders 后转「排队次日重试」(转 next_open, 计顺延, 超限过期);
   - 停牌/缺行情: 顺延, 连续顺延超过 max_postpone 日自动过期;
-  - 除权: 按 ex_factor 调整持仓数量(乘 factor)与成本(除以 factor), 台账记 corp_action;
-    现金分红金额不在因子数据中, 不处理。
+  - ashare_v1 公司行动: 每股分红先记应收, 已知派息日到账; 每股送股新增批次,
+    已知上市日才可卖。配股/明细不全/无规则的零碎股拒绝记账。
+  - 旧 factor 记录及显式 legacy 账户保留原有解释, 不重写历史。
 """
 from __future__ import annotations
 
@@ -42,6 +43,7 @@ import polars as pl
 from app.market_time import CN_TZ, cn_now, cn_today
 from app.parquet import scan_daily_parquet
 from app.services.fs_utils import atomic_write_text
+from app.strategy import corporate_actions as corporate
 from app.trading_costs import FeePolicy
 
 logger = logging.getLogger(__name__)
@@ -132,8 +134,21 @@ def _nav_dir(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID) -> Path:
     return d
 
 
-def _now_iso() -> str:
-    return cn_now().isoformat()
+def _clock_now(as_of: datetime | None = None) -> datetime:
+    """Replay naive clocks are Beijing wall time; aware clocks are normalized."""
+    if as_of is None:
+        return cn_now()
+    return as_of.replace(tzinfo=CN_TZ) if as_of.tzinfo is None else as_of.astimezone(CN_TZ)
+
+
+def _clock_day(as_of: datetime | _date | None = None) -> str:
+    if as_of is None:
+        return cn_today().isoformat()
+    return _clock_now(as_of).date().isoformat() if isinstance(as_of, datetime) else as_of.isoformat()
+
+
+def _now_iso(as_of: datetime | None = None) -> str:
+    return _clock_now(as_of).isoformat()
 
 
 def _new_id(prefix: str) -> str:
@@ -399,6 +414,7 @@ def create_order(
     asset_type: str | None = None,
     ref_price: float | None = None,
     source: str = "manual",
+    as_of: datetime | None = None,
 ) -> tuple[dict | None, str | None]:
     """创建订单并校验。qty 与 amount 二选一 (amount 按参考价折算百股)。
 
@@ -414,13 +430,16 @@ def create_order(
             return None, "账户已冻结, 拒绝新订单"
         if side not in ("buy", "sell"):
             return None, f"side 非法: {side!r}"
-        if order_type not in ("market", "next_open", "close"):
+        if order_type not in ("market", "next_open", "close", "t_signal"):
             return None, f"order_type 非法: {order_type!r}"
         symbol = (symbol or "").strip()
         if not symbol:
             return None, "symbol 不能为空"
         if asset_type is None:
             asset_type = "etf" if symbol.endswith((".SH", ".SZ")) and symbol.split(".")[0].startswith(("51", "56", "58", "15")) else "stock"
+
+        if acc.get("fee_model", "legacy") == "ashare_v1":
+            ex_reference_close(data_dir, symbol, asset_type, _clock_day(as_of))
 
         # ETF 即时单 → 次日开盘 (盘中钩子只喂股票快照)
         if order_type == "market" and asset_type == "etf":
@@ -438,15 +457,17 @@ def create_order(
         if qty <= 0 or qty % LOT_SIZE != 0:
             return None, f"数量必须是 {LOT_SIZE} 的整数倍"
 
+        apply_corporate_actions(data_dir, _clock_day(as_of), account_id, as_of=as_of)
+        acc = get_account(data_dir, account_id)
         acc_cash = float(acc["cash"])
         if side == "buy":
             # 买入资金预检 (按参考价上界估算, 撮合时二次校验)
             est_price = float(ref_price) if ref_price else 0.0
             executed = apply_slippage(est_price, "buy", acc["slippage_bps"]) if est_price > 0 else 0
-            if est_price > 0 and qty * executed + _account_fee(acc, qty, executed, "buy", cn_today().isoformat(), asset_type) > acc_cash:
+            if est_price > 0 and qty * executed + _account_fee(acc, qty, executed, "buy", _clock_day(as_of), asset_type) > acc_cash:
                 return None, f"可用资金不足 (需约 {qty * est_price:.0f}, 可用 {acc_cash:.0f})"
         else:
-            held = sell_capacity(data_dir, symbol, account_id)
+            held = sell_capacity(data_dir, symbol, account_id, as_of=as_of)
             if held is None:
                 return None, f"无 {symbol} 持仓, 不能卖出"
             available, pending_sell = held
@@ -478,7 +499,7 @@ def create_order(
             "ref_price": float(ref_price) if ref_price else None,
             "postponed": 0,        # 顺延交易日计数 (停牌顺延 / 涨跌停排队共用)
             "source": source,      # manual / auto:{rule_id}
-            "created_at": _now_iso(),
+            "created_at": _now_iso() if as_of is None else _now_iso(as_of),
             "filled_at": None,
             "fill_price": None,
             "fees": None,
@@ -544,7 +565,7 @@ def replay_positions(
 
     持仓结构: {symbol: {asset_type, qty, avg_cost, available_qty,
                         lots: [{date: 'YYYY-MM-DD', qty}]}}
-    corp_action 行: 数量乘 factor、成本除以 factor、日期归属保持原 buy_date。
+    V2 公司行动独立记应收/现金/锁定送股; 旧 factor 行保留原解释。
     """
     acc = get_account(data_dir, account_id)
     cash = float(acc["initial_cash"]) if acc else 0.0
@@ -552,6 +573,30 @@ def replay_positions(
     for f in fills if fills is not None else load_fills(data_dir, account_id):
         kind = f.get("kind", "fill")
         symbol = f["symbol"]
+        if kind == "corp_payment":
+            cash += float(f["cash_delta"])
+            continue
+        if kind in ("corp_release", "corp_evidence"):
+            listing_date = f.get("listing_date") or f.get("available_date")
+            if listing_date:
+                for lot in positions.get(symbol, {}).get("lots", []):
+                    if lot.get("event_id") == f["event_id"]:
+                        lot["available_date"] = listing_date
+            continue
+        if kind == "corp_action" and f.get("schema_version") == 2:
+            cash += float(f.get("cash_delta", 0))
+            bonus_qty = int(f.get("bonus_qty", 0))
+            if bonus_qty:
+                pos = positions.setdefault(symbol, {
+                    "asset_type": f.get("asset_type", "stock"),
+                    "qty": 0, "avg_cost": 0.0, "available_qty": 0, "lots": [],
+                })
+                cost = pos["avg_cost"] * pos["qty"]
+                pos["qty"] += bonus_qty
+                pos["avg_cost"] = round(cost / pos["qty"], 6)
+                pos["lots"].append({"date": f["date"], "qty": bonus_qty,
+                                    "available_date": f.get("available_date"), "event_id": f["event_id"]})
+            continue
         if kind == "corp_action":
             pos = positions.get(symbol)
             if pos is None:
@@ -588,6 +633,8 @@ def replay_positions(
             for lot in pos["lots"]:
                 if remain <= 0:
                     break
+                if not _lot_sellable(lot, f.get("date", "")):
+                    continue
                 take = min(lot["qty"], remain)
                 lot["qty"] -= take
                 remain -= take
@@ -601,6 +648,7 @@ def replay_positions(
 
 def sell_capacity(
     data_dir: Path, symbol: str, account_id: str = DEFAULT_ACCOUNT_ID,
+    *, as_of: datetime | _date | None = None,
 ) -> tuple[int, int] | None:
     """(T+1 可卖数量, 同 symbol 已挂 pending 卖出合计); 无持仓返回 None。
 
@@ -611,7 +659,7 @@ def sell_capacity(
     pos = load_positions(data_dir, account_id).get(symbol)
     if pos is None or pos["qty"] <= 0:
         return None
-    available = _available_of(pos, cn_today().isoformat())
+    available = _available_of(pos, _clock_day(as_of))
     pending_sell = sum(
         int(o["qty"]) for o in load_orders(data_dir, account_id)
         if o["status"] == "pending" and o["side"] == "sell" and o["symbol"] == symbol
@@ -619,11 +667,15 @@ def sell_capacity(
     return available, pending_sell
 
 
+def _lot_sellable(lot: dict, today: str | None) -> bool:
+    if "available_date" in lot:
+        return lot["available_date"] is not None and (today is None or lot["available_date"] <= today)
+    return today is None or lot["date"] < today
+
+
 def _available_of(pos: dict, today: str | None = None) -> int:
-    """T+1 可卖数量: buy_date < today 的批次之和。today 为空则全部可卖 (重建口径)。"""
-    if today is None:
-        return int(sum(lot["qty"] for lot in pos["lots"]))
-    return int(sum(lot["qty"] for lot in pos["lots"] if lot["date"] < today))
+    """Ordinary lots obey T+1; bonus lots need an evidenced listing date."""
+    return int(sum(lot["qty"] for lot in pos["lots"] if _lot_sellable(lot, today)))
 
 
 def _append_fill(data_dir: Path, fill: dict, account_id: str = DEFAULT_ACCOUNT_ID) -> None:
@@ -665,7 +717,7 @@ def rebuild_positions(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID) -> d
 
 
 # ── 撮合 ────────────────────────────────────────────────
-def _fill_order(data_dir: Path, order: dict, raw_price: float, day: str, account_id: str = DEFAULT_ACCOUNT_ID) -> dict | None:
+def _fill_order(data_dir: Path, order: dict, raw_price: float, day: str, account_id: str = DEFAULT_ACCOUNT_ID, *, as_of: datetime | None = None) -> dict | None:
     """按指定 raw 价成交一笔订单 (费用/滑点/资金与持仓校验), 返回 fill 或 None。
 
     调用方持锁。涨跌停按账户 queue_limit_orders 开关: 关 → expired 留痕;
@@ -674,17 +726,20 @@ def _fill_order(data_dir: Path, order: dict, raw_price: float, day: str, account
     acc = get_account(data_dir, account_id)
     symbol, side, qty = order["symbol"], order["side"], int(order["qty"])
     asset_type = order.get("asset_type", "stock")
+    # 涨跌停以 raw 前收为基础; 新账本在除权日使用每股权益调整参考价。
+    prev = (ex_reference_close(data_dir, symbol, asset_type, day)
+            if acc.get("fee_model", "legacy") == "ashare_v1"
+            else _prev_close(data_dir, symbol, asset_type, day))
+    apply_corporate_actions(data_dir, day, account_id, as_of=as_of)
+    acc = get_account(data_dir, account_id)
     price = apply_slippage(raw_price, side, float(acc["slippage_bps"]))
-
-    # 涨跌停检查 (基于上一交易日 raw close; 无上日收盘则跳过检查 — 新股/数据缺失)
-    prev = _prev_close(data_dir, symbol, asset_type, day)
     if prev is not None:
         up, down = limit_prices(prev, symbol, asset_type)
         if side == "buy" and price >= up:
-            _queue_or_expire(data_dir, order, acc, f"触及涨停 {up} 买不进 (模拟)", account_id)
+            _queue_or_expire(data_dir, order, acc, f"触及涨停 {up} 买不进 (模拟)", account_id, as_of=as_of)
             return None
         if side == "sell" and price <= down:
-            _queue_or_expire(data_dir, order, acc, f"触及跌停 {down} 卖不出 (模拟)", account_id)
+            _queue_or_expire(data_dir, order, acc, f"触及跌停 {down} 卖不出 (模拟)", account_id, as_of=as_of)
             return None
 
     fee = _account_fee(acc, qty, price, side, day, asset_type)
@@ -725,8 +780,8 @@ def _fill_order(data_dir: Path, order: dict, raw_price: float, day: str, account
             return None
 
     fill = {
-        "seq": int(datetime.now().timestamp() * 1000),
-        "ts": _now_iso(),
+        "seq": int(_clock_now(as_of).timestamp() * 1000),
+        "ts": _now_iso() if as_of is None else _now_iso(as_of),
         "date": day,
         "order_id": order["id"],
         "symbol": symbol,
@@ -756,7 +811,7 @@ def _fill_order(data_dir: Path, order: dict, raw_price: float, day: str, account
         label = "模拟盘" if account_id == DEFAULT_ACCOUNT_ID else f"模拟盘[{acc.get('name') or account_id}]"
         from app.services import alert_store
         alert_store.append_many(data_dir, [{
-            "ts": int(datetime.now().timestamp() * 1000),
+            "ts": int(_clock_now(as_of).timestamp() * 1000),
             "source": "paper",
             "type": "paper_fill",
             "rule_id": None,
@@ -786,8 +841,12 @@ def _expire(data_dir: Path, order: dict, reason: str, account_id: str = DEFAULT_
     save_order(data_dir, order, account_id)
 
 
-def _queue_or_expire(data_dir: Path, order: dict, acc: dict, reason: str, account_id: str = DEFAULT_ACCOUNT_ID) -> None:
+def _queue_or_expire(data_dir: Path, order: dict, acc: dict, reason: str, account_id: str = DEFAULT_ACCOUNT_ID, *, as_of: datetime | None = None) -> None:
     """涨跌停拒单处理: 排队开启 → 转 next_open 次日重试 (计顺延, 超限过期); 关 → 过期。"""
+    # Strategy signals must never escape into the generic next-open matcher.
+    if order.get("order_type") == "t_signal":
+        _expire(data_dir, order, reason, account_id)
+        return
     postponed = int(order.get("postponed", 0))
     if acc.get("queue_limit_orders"):
         if postponed < MAX_POSTPONE_DAYS:
@@ -795,7 +854,7 @@ def _queue_or_expire(data_dir: Path, order: dict, acc: dict, reason: str, accoun
             order["postponed"] = postponed + 1
             order["reason"] = f"{reason}; 排队次日重试 ({postponed + 1}/{MAX_POSTPONE_DAYS})"
             # 排队时刻: 盘中排队的单不能按当日 (排队之前已打印的) 开盘价成交
-            order["queued_at"] = _now_iso()
+            order["queued_at"] = _now_iso() if as_of is None else _now_iso(as_of)
             save_order(data_dir, order, account_id)
             return
         reason = f"{reason}; 排队 {MAX_POSTPONE_DAYS} 日未成交, 过期"
@@ -926,6 +985,175 @@ def _index_close(data_dir: Path, day: str) -> float | None:
     return float(df["close"][0])
 
 
+def receivable_balance(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID) -> float:
+    """Gross unpaid dividend entitlements; no invented personal tax schedule."""
+    return round(sum(float(f.get("cash_receivable", 0)) for f in load_fills(data_dir, account_id)
+                     if f.get("schema_version") == 2), 2)
+
+
+def apply_corporate_actions(
+    data_dir: Path, day: str, account_id: str = DEFAULT_ACCOUNT_ID,
+    *, as_of: datetime | None = None,
+) -> int:
+    """Apply all outstanding events through day before orders, atomically validated.
+
+    Entitlement comes from inventory immediately before each ex-date, including
+    after skipped evaluation days. Legacy/frozen accounts are never rewritten.
+    """
+    day = corporate.iso_day(day, "day")
+    with PAPER_LOCK:
+        acc = get_account(data_dir, account_id)
+        if acc is None or acc.get("fee_model", "legacy") != "ashare_v1" or acc.get("status") != "active":
+            return 0
+        fills = load_fills(data_dir, account_id)
+        by_asset: dict[str, set[str]] = {}
+        for f in fills:
+            if f.get("kind", "fill") == "fill" and f.get("side") == "buy":
+                by_asset.setdefault(f.get("asset_type", "stock"), set()).add(f["symbol"])
+        applied = {(f["symbol"], f["date"]): f for f in fills if f.get("kind") == "corp_action"}
+        paid = {f["event_id"] for f in fills if f.get("kind") == "corp_payment"}
+        # Every previously observed date is binding, including older release/payment
+        # records. A later source conflict requires manual review, never correction.
+        dates: dict[str, dict[str, set[str]]] = {}
+        for f in fills:
+            if f.get("schema_version") != 2 or not f.get("event_id"):
+                continue
+            evidence = dates.setdefault(f["event_id"], {"pay_date": set(), "listing_date": set()})
+            pay_date = f.get("pay_date") or (f["date"] if f.get("kind") == "corp_payment" else None)
+            listing_date = f.get("listing_date") or f.get("available_date")
+            for field, value in (("pay_date", pay_date), ("listing_date", listing_date)):
+                if value is not None:
+                    evidence[field].add(corporate.iso_day(value, field))
+                if len(evidence[field]) > 1:
+                    raise corporate.UnsupportedCorporateActionError("公司行动已记录的日期证据冲突，需人工复核")
+        planned: list[dict] = []
+        source_events = {}
+        source_rows = []
+        for asset_type, symbols in by_asset.items():
+            source_rows.extend(corporate.rows_through(data_dir, asset_type, symbols, day))
+        for row in sorted(source_rows, key=lambda r: (r["trade_date"], r["symbol"])):
+            symbol, ex_date = row["symbol"], row["trade_date"]
+            existing = applied.get((symbol, ex_date))
+            if existing is not None and existing.get("schema_version") != 2:
+                continue  # Recorded legacy events retain their historical interpretation.
+            prior = [f for f in fills + planned if f["date"] < ex_date]
+            eligible = replay_positions(data_dir, prior, account_id)[0].get(symbol, {}).get("qty", 0)
+            if not eligible and existing is None:
+                continue
+            event = corporate.normalize(row)
+            if event is None:
+                continue
+            event_id = f"{row['asset_type']}:{symbol}:{ex_date}"
+            source_events[event_id] = event
+            if existing is not None:
+                if (existing["dividend_per_share"] != event["dividend"]
+                        or existing["bonus_per_share"] != event["bonus"]):
+                    raise corporate.UnsupportedCorporateActionError("公司行动已记账明细发生变化，拒绝重写历史")
+                recorded_dates = dates.get(event_id, {})
+                for field in ("pay_date", "listing_date"):
+                    known = recorded_dates.get(field, set())
+                    if event[field] is not None and known and event[field] not in known:
+                        raise corporate.UnsupportedCorporateActionError(f"公司行动 {field} 日期证据冲突，需人工复核")
+                continue
+            bonus_qty = corporate.bonus_quantity(eligible, event["bonus"])
+            cash_entitlement = corporate.finite_nonnegative(eligible * event["dividend"], "cash_receivable")
+            record = {
+                "seq": 0, "ts": "", "date": ex_date, "order_id": None,
+                "symbol": symbol, "asset_type": row["asset_type"], "side": "corp_action",
+                "kind": "corp_action", "schema_version": 2, "event_id": event_id,
+                "eligible_qty": eligible, "dividend_per_share": event["dividend"],
+                "bonus_per_share": event["bonus"], "share_multiplier": 1 + event["bonus"],
+                "bonus_qty": bonus_qty, "cash_receivable": round(cash_entitlement, 2),
+                "cash_delta": 0, "pay_date": event["pay_date"],
+                "available_date": event["listing_date"], "tax_basis": "gross",
+                "warning": "现金分红按税前金额计入应收，个人红利税未模拟",
+            }
+            planned.append(record)
+            applied[symbol, ex_date] = record
+        for recorded in applied.values():
+            if recorded.get("schema_version") != 2:
+                continue
+            event_id = recorded["event_id"]
+            source = source_events.get(event_id, {})
+            recorded_dates = dates.get(event_id, {"pay_date": set(), "listing_date": set()})
+            pay_date = (source.get("pay_date") or recorded.get("pay_date")
+                        or next(iter(recorded_dates["pay_date"]), None))
+            listing_date = (source.get("listing_date") or recorded.get("available_date")
+                            or next(iter(recorded_dates["listing_date"]), None))
+            learned = {}
+            for field, value, initial in (("pay_date", pay_date, recorded.get("pay_date")),
+                                           ("listing_date", listing_date, recorded.get("available_date"))):
+                if value is not None and initial is None and not recorded_dates[field]:
+                    learned[field] = value
+            if learned:
+                planned.append({
+                    "seq": 0, "ts": "", "date": day, "order_id": None,
+                    "symbol": recorded["symbol"], "asset_type": recorded["asset_type"],
+                    "side": "corp_action", "kind": "corp_evidence", "schema_version": 2,
+                    "event_id": event_id, **learned,
+                })
+            amount = float(recorded.get("cash_receivable", 0))
+            if amount and pay_date and pay_date <= day and event_id not in paid:
+                planned.append({
+                    "seq": 0, "ts": "", "date": pay_date, "order_id": None,
+                    "symbol": recorded["symbol"], "asset_type": recorded["asset_type"],
+                    "side": "corp_action", "kind": "corp_payment", "schema_version": 2,
+                    "event_id": event_id, "cash_delta": amount, "cash_receivable": -amount,
+                })
+        if planned or any(f.get("schema_version") == 2 for f in fills):
+            # Multiplication and accumulation can overflow even with finite inputs.
+            # Validate the entire candidate ledger, account and materialization first.
+            try:
+                positions, candidate_cash = replay_positions(data_dir, fills + planned, account_id)
+                candidate_receivable = round(sum(float(f.get("cash_receivable", 0)) for f in fills + planned
+                                                 if f.get("schema_version") == 2), 2)
+                corporate.finite_nonnegative(candidate_cash, "cash")
+                corporate.finite_nonnegative(candidate_receivable, "receivable")
+                for pos in positions.values():
+                    corporate.finite_nonnegative(pos["qty"], "qty")
+                    corporate.finite_nonnegative(pos["avg_cost"], "avg_cost")
+                corporate.strict_json({**acc, "cash": candidate_cash})
+                corporate.strict_json(positions)
+            except (OverflowError, ArithmeticError) as exc:
+                raise corporate.UnsupportedCorporateActionError("公司行动派生金额 overflow，拒绝记账") from exc
+        if planned:
+            # Validate the complete batch before a single ledger publication.
+            stamp = _now_iso() if as_of is None else _now_iso(as_of)
+            seq = int(_clock_now(as_of).timestamp() * 1000)
+            for index, record in enumerate(planned):
+                record.update(ts=stamp, seq=seq + index)
+            path = _fills_path(data_dir, account_id)
+            old = path.read_text(encoding="utf-8") if path.exists() else ""
+            serialized = "".join(corporate.strict_json(f) + "\n" for f in planned)
+            atomic_write_text(path, old + serialized)
+        # Reconstruct after restart even if the prior process stopped after append.
+        if planned or any(f.get("schema_version") == 2 for f in fills):
+            cash = replay_positions(data_dir, account_id=account_id)[1]
+            if float(acc["cash"]) != cash:
+                acc["cash"] = cash
+                save_account(data_dir, acc, account_id)
+            _materialize(data_dir, account_id)
+        return len(planned)
+
+
+def ex_reference_close(data_dir: Path, symbol: str, asset_type: str, day: str) -> float | None:
+    """Ex-day reference from raw previous close and per-share event economics."""
+    prev = _prev_close(data_dir, symbol, asset_type, day)
+    rows = corporate.rows_through(data_dir, asset_type, {symbol}, day)
+    current = next((row for row in rows if row["trade_date"] == day), None)
+    if current is None:
+        return prev
+    event = corporate.normalize(current)
+    if event is None:
+        return prev
+    if prev is None:
+        return None
+    reference = (prev - event["dividend"]) / (1 + event["bonus"])
+    if reference <= 0:
+        raise corporate.UnsupportedCorporateActionError("公司行动除权参考价无效")
+    return reference
+
+
 def _factor_on(data_dir: Path, symbol: str, asset_type: str, day: str) -> float | None:
     """symbol 在 day 的除权因子 (无因子文件/无当日事件返回 None)。"""
     sub = "adj_factor_etf" if asset_type == "etf" else "adj_factor"
@@ -971,7 +1199,7 @@ def _placed_after_price_time(order: dict, day: str) -> bool:
 
 
 def settle_day(data_dir: Path, day: str, account_id: str = DEFAULT_ACCOUNT_ID) -> dict:
-    """盘后管道阶段: 撮合顺延单 → 除权调整 → 定版净值。幂等 (重跑同日安全)。
+    """盘后管道阶段: 新账本公司行动 → 撮合顺延单 → 旧账本除权 → 定版净值。
 
     撮合顺序: close 单用 raw_close; next_open 单用 raw_open; 仍 pending 的
     market 单 (当日无快照) 也按 raw_close 兜底成交 — 避免停牌外无限顺延。
@@ -983,8 +1211,10 @@ def settle_day(data_dir: Path, day: str, account_id: str = DEFAULT_ACCOUNT_ID) -
         acc = get_account(data_dir, account_id)
         if acc is None:
             return summary
+        summary["corp_actions"] = apply_corporate_actions(data_dir, day, account_id)
         pending_orders = sorted(
-            (o for o in load_orders(data_dir, account_id) if o["status"] == "pending"),
+            (o for o in load_orders(data_dir, account_id) if o["status"] == "pending"
+             and o["order_type"] in ("market", "next_open", "close")),
             key=_order_sort_key,
         )
         for order in pending_orders:
@@ -1017,7 +1247,7 @@ def settle_day(data_dir: Path, day: str, account_id: str = DEFAULT_ACCOUNT_ID) -
             if f.get("kind") == "corp_action"
         }
         for symbol, pos in positions.items():
-            if pos["qty"] <= 0:
+            if acc.get("fee_model", "legacy") == "ashare_v1" or pos["qty"] <= 0:
                 continue
             factor = _factor_on(data_dir, symbol, pos.get("asset_type", "stock"), day)
             if factor is None or factor == 1.0 or (symbol, day) in applied:
@@ -1085,7 +1315,9 @@ def daily_nav(
             continue
         price = prices.get(symbol, pos["avg_cost"])
         mv += pos["qty"] * price
-    return {"date": day, "cash": round(float(acc["cash"]), 2), "mv": round(mv, 2), "nav": round(float(acc["cash"]) + mv, 2)}
+    receivable = receivable_balance(data_dir, account_id)
+    return {"date": day, "cash": round(float(acc["cash"]), 2), "mv": round(mv, 2),
+            "receivable": receivable, "nav": round(float(acc["cash"]) + mv + receivable, 2)}
 
 
 def _write_nav_line(data_dir: Path, day: str, nav: dict, account_id: str = DEFAULT_ACCOUNT_ID) -> None:
@@ -1142,6 +1374,7 @@ def overview(data_dir: Path, price_map: dict[str, float] | None = None, account_
             "pnl_pct": round((last / pos["avg_cost"] - 1) * 100, 2) if pos["avg_cost"] else 0.0,
             "available_qty": _available_of(pos, today),
         })
+    receivable = receivable_balance(data_dir, account_id)
     return {
         "initialized": True,
         "account_id": account_id,
@@ -1150,8 +1383,9 @@ def overview(data_dir: Path, price_map: dict[str, float] | None = None, account_
         "queue_limit_orders": bool(acc.get("queue_limit_orders")),
         "cash": round(float(acc["cash"]), 2),
         "market_value": round(mv, 2),
-        "total": round(float(acc["cash"]) + mv, 2),
-        "total_pnl": round(float(acc["cash"]) + mv - float(acc["initial_cash"]), 2),
+        "receivable": receivable,
+        "total": round(float(acc["cash"]) + mv + receivable, 2),
+        "total_pnl": round(float(acc["cash"]) + mv + receivable - float(acc["initial_cash"]), 2),
         "initial_cash": float(acc["initial_cash"]),
         "estimating": price_map is not None,
         "holdings": holdings,
@@ -1160,7 +1394,7 @@ def overview(data_dir: Path, price_map: dict[str, float] | None = None, account_
 
 # ── 回合统计 (FIFO) ─────────────────────────────────────
 def round_trips(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID) -> list[dict]:
-    """FIFO 配对的开→平回合: 入场价含买入费, 出场净额扣卖出费。"""
+    """Pure-fill FIFO: fees included; corporate-action cost allocation excluded."""
     fills = [f for f in load_fills(data_dir, account_id) if f.get("kind", "fill") == "fill"]
     lots: dict[str, list[dict]] = {}
     rounds: list[dict] = []
@@ -1225,6 +1459,8 @@ def stats(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID) -> dict:
         "avg_holding_days": round(sum(r["holding_days"] for r in rounds) / len(rounds), 1) if rounds else 0.0,
         "realized_pnl": round(sum(r["pnl"] for r in rounds), 2),
         "max_drawdown": round(mdd * 100, 2) if mdd is not None else None,
+        "warnings": (["成交回合的已实现盈亏未调整公司行动成本，请以含分红应收的净值衡量总收益"]
+                     if any(f.get("kind") == "corp_action" for f in load_fills(data_dir, account_id)) else []),
     }
 
 

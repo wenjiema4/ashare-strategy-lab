@@ -235,3 +235,28 @@ def test_matrix_native_resolves_raw_fields_and_protocol_warmup_without_indicator
     assert {"open", "high", "low", "close", "volume", "amount"} <= set(plan.base_columns)
     assert plan.warmup_bars == 120
     assert plan.full_feature_fallback is False
+
+
+def test_native_near_limit_strategy_can_compute_with_resolved_market_fields():
+    """Resolver must retain synthetic limit fields through matrix construction."""
+    from app.backtest.matrix import build_market_data_matrix
+    from app.strategy.seeds.near_limit_up import MATRIX_STRATEGY
+
+    strategy = _strategy(
+        meta={"id": "near_limit_test", "scoring": {}, "order_by": "close"},
+        filter_fn=None, filter_history_fn=None, execution_backend="matrix_native",
+        matrix_strategy=MATRIX_STRATEGY, required_features=frozenset(),
+    )
+    plan = StrategyDependencyResolver().resolve(
+        strategy, params={}, basic_filter={"enabled": False},
+        entry_signals=[], exit_signals=[],
+    )
+    panel = pl.DataFrame({
+        "date": [date(2026, 1, 5), date(2026, 1, 6)],
+        "symbol": ["600000.SH", "600000.SH"], "name": ["样本", "样本"],
+        "open": [10.0, 10.8], "high": [10.0, 10.8], "low": [10.0, 10.8],
+        "close": [10.0, 10.8], "raw_close": [10.0, 10.8], "volume": [1000.0, 1000.0],
+    })
+    market = build_market_data_matrix(panel, field_columns=plan.matrix_columns)
+    signals = MATRIX_STRATEGY.compute_signals(market, {})
+    assert signals.entry[:, 0].tolist() == [0, 1]

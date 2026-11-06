@@ -18,11 +18,19 @@ from typing import Any
 
 import psutil
 
+from app.trading_costs import RawPriceEvidenceError
+
 logger = logging.getLogger(__name__)
 
 
 class BacktestWorkerError(RuntimeError):
     """Raised when a spawned worker fails before returning a task result."""
+
+
+class BacktestValidationError(BacktestWorkerError):
+    """Safe, actionable validation failure preserved across the process boundary."""
+
+    code = RawPriceEvidenceError.code
 
 
 _CANCEL_GRACE_SECONDS = 5.0
@@ -318,6 +326,7 @@ def _worker_entry(task: dict[str, Any], event_queue, cancel_event) -> None:
             "type": "error",
             "message": _error_message(exc),
             "traceback": traceback.format_exc(),
+            "code": RawPriceEvidenceError.code if isinstance(exc, RawPriceEvidenceError) else None,
         })
     finally:
         if store is not None:
@@ -442,6 +451,8 @@ def run_worker_task(
                 process.exitcode,
             )
         if failure is not None:
+            if failure.get("code") == RawPriceEvidenceError.code:
+                raise BacktestValidationError(str(RawPriceEvidenceError()))
             raise BacktestWorkerError(
                 f"{failure.get('message', 'worker failed')}\n{failure.get('traceback', '')}".rstrip()
             )

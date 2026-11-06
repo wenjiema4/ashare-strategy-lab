@@ -314,9 +314,10 @@ def test_settle_idempotent_no_double_fill(tmp_path):
     assert cash == pytest.approx(1_000_000 - fills[0]["qty"] * fills[0]["price"] - fills[0]["fee"])
 
 
-def test_corporate_action_adjusts_position_and_idempotent(tmp_path):
+def test_legacy_corporate_factor_position_and_idempotency(tmp_path):
+    # Factor-only historic accounting remains explicit legacy behavior.
     day = date(2026, 9, 24)
-    _cap_account(tmp_path)
+    paper.create_account(tmp_path, 1_000_000, fee_model="legacy")
     _write_daily(tmp_path, [
         (day - timedelta(days=1), 10.0, 10.0),
         (day, 8.0, 8.0),  # 除权后价格

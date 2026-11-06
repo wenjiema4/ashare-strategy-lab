@@ -119,6 +119,55 @@ export interface CapabilitiesResponse {
   capabilities: Record<string, CapabilityLimits>
 }
 
+// ===== 底仓做T（本地原价分钟数据、纯模拟） =====
+export interface TStrategyConfig {
+  symbol: string
+  start: string
+  end: string
+  initial_cash: number
+  base_qty: number
+  trade_qty: number
+  rise_pct: number
+  pullback_pct: number
+  start_time: string
+  restore_time: string
+  commission_pct: number
+  slippage_bps: number
+}
+export interface TStrategyCoverage {
+  start: string | null
+  end: string | null
+  sessions: number
+  bars: number
+}
+export interface TStrategyResult {
+  id: string
+  params: TStrategyConfig
+  stats: {
+    initial_cash: number; final_nav: number; return_pct: number
+    benchmark_nav: number; excess_pnl: number; round_trips: number
+    fills: number; fees: number; receivable?: number
+  }
+  nav: { date: string; cash: number; mv: number; nav: number; receivable?: number }[]
+  fills: { date: string; ts: string; side: string; qty: number; price: number; fee: number; kind?: string }[]
+  events: Record<string, unknown>[]
+  warnings: string[]
+  coverage: TStrategyCoverage
+}
+export interface TStrategyStatus {
+  defaults: TStrategyConfig
+  coverage: TStrategyCoverage
+  runs: Pick<TStrategyResult, 'id' | 'params' | 'stats'>[]
+  accounts: { id: string; name: string; status: string; cash: number }[]
+}
+export interface TStrategyManualResult {
+  status: string
+  message: string
+  account: string
+  order?: Record<string, unknown>
+  filled?: Record<string, unknown>[]
+}
+
 // ===== Financials =====
 export interface FinancialStatus {
   available: boolean
@@ -4829,6 +4878,16 @@ export const api = {
 
   lotDelete: (id: string) =>
     request<{ ok: boolean }>(`/api/lots/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+
+  // 底仓做T复用统一请求与计算超时；所有写入均由页面显式按钮触发。
+  tStrategyStatus: () => request<TStrategyStatus>('/api/t-strategy/status', { quiet: true }),
+  tStrategyBacktest: (body: TStrategyConfig) =>
+    request<TStrategyResult>('/api/t-strategy/backtest', { method: 'POST', body: JSON.stringify(body), timeoutMs: COMPUTE_REQUEST_TIMEOUT_MS, quiet: true }),
+  tStrategyRun: (id: string) => request<TStrategyResult>(`/api/t-strategy/runs/${encodeURIComponent(id)}`, { quiet: true }),
+  tStrategyImportPaper: (id: string) =>
+    request<{ account: string; frozen: true }>(`/api/t-strategy/runs/${encodeURIComponent(id)}/paper`, { method: 'POST', body: '{}', quiet: true }),
+  tStrategyManualStep: (body: TStrategyConfig & { account: string }) =>
+    request<TStrategyManualResult>('/api/t-strategy/manual/step', { method: 'POST', body: JSON.stringify(body), quiet: true }),
 
   // ===== Paper (虚拟账户/模拟盘: 虚拟资金 + 真实行情价格模拟撮合, 多账户) =====
   paperAccounts: () =>

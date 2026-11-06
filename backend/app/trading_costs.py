@@ -20,6 +20,15 @@ STAMP_HALVED_FROM = date(2023, 8, 28)
 SUPPORTED_FROM = date(2022, 4, 29)
 
 
+class RawPriceEvidenceError(ValueError):
+    """Cash accounting cannot safely execute on adjusted or unproven prices."""
+
+    code = "raw_price_evidence_required"
+
+    def __init__(self):
+        super().__init__("金额费用回测需要未复权原始价证据；复权持仓账本尚未启用，请使用原比例费用")
+
+
 def _money(value: float) -> float:
     return float(Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 

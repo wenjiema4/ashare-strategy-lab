@@ -348,7 +348,10 @@ class StrategyDependencyResolver:
             scoring_warmup_bars(scoring),
             scoring_warmup_bars(parameter_scoring),
         )
-        matrix_columns = set(base_columns) | set(instrument_columns) | overlay_fields | {
+        # These fields are synthesized by the matrix loader, not stored in
+        # enriched Parquet. Keep them after resolving physical columns.
+        synthetic_fields = required_features & {"price_limit_pct"}
+        matrix_columns = set(base_columns) | set(instrument_columns) | overlay_fields | synthetic_fields | {
             "signal_limit_up",
             "signal_limit_down",
         }
