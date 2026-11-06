@@ -7,13 +7,26 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { TStrategy } from './Page'
 import { QK } from '@/lib/queryKeys'
 
-const config = { symbol: '000001.SZ', start: '2026-10-01', end: '2026-10-31', initial_cash: 100000, base_qty: 600, trade_qty: 300, rise_pct: 1, pullback_pct: 1, start_time: '09:45', restore_time: '14:55', commission_pct: 0.00025, slippage_bps: 5 }
+const config = { symbol: '000001.SZ', start: '2026-10-01', end: '2026-10-31', initial_cash: 100000, base_qty: 600, trade_qty: 300, rise_pct: 1, pullback_pct: 1, start_time: '09:45', restore_time: '14:55', commission_pct: 0.00025, slippage_bps: 5, mode: 'classic', vwap_deviation_pct: 0.5, min_net_profit: 10 }
 const result = { id: 'run_1', params: config, stats: { initial_cash: 100000, final_nav: 101000, return_pct: 1, benchmark_nav: 100500, excess_pnl: 500, round_trips: 2, fills: 5, fees: 33, receivable: 100 }, nav: [{ date: '2026-10-09', cash: 95000, mv: 6000, nav: 101000, receivable: 100 }], fills: [{ date: '2026-10-09', ts: '2026-10-09 09:46:00', side: 'sell', qty: 300, price: 10.8, fee: 6, kind: 't_sell' }], events: [{ type: 'rejected', message: '跌停无法成交' }], warnings: ['尚有回补义务'], coverage: { start: '2026-10-09', end: '2026-10-09', bars: 240, sessions: 1 } }
 const status = { defaults: config, coverage: { start: '2026-10-08', end: '2026-10-09', bars: 480, sessions: 2 }, runs: [], accounts: [{ id: 'frozen', name: '历史账户', status: 'frozen', cash: 1 }, { id: 'sim_t', name: '底仓模拟', status: 'active', cash: 100000 }] }
 let root: Root
 let client: QueryClient
 let node: HTMLDivElement
 let requests: { path: string; body: any }[]
+
+it('keeps classic default and explicitly submits the optional guarded mode', async () => {
+  await render()
+  const select = node.querySelector<HTMLSelectElement>('select[name="mode"]')!
+  expect(select.value).toBe('classic')
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')!.set!.call(select, 'cost_vwap')
+    select.dispatchEvent(new Event('change', { bubbles: true }))
+  })
+  expect(node.textContent).toContain('预计最低净差（元）')
+  await click('运行回测')
+  expect(requests.find(r => r.path.endsWith('/backtest'))!.body).toMatchObject({ mode: 'cost_vwap', vwap_deviation_pct: 0.5, min_net_profit: 10 })
+})
 let reply: (path: string, body: any) => Response | Promise<Response>
 const json = (value: unknown, code = 200) => new Response(JSON.stringify(value), { status: code, headers: { 'Content-Type': 'application/json' } })
 async function wait(assert: () => void) { await vi.waitFor(async () => { await act(async () => { await new Promise(r => setTimeout(r, 0)) }); assert() }) }

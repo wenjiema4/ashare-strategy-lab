@@ -121,6 +121,9 @@ export interface CapabilitiesResponse {
 
 // ===== 底仓做T（本地原价分钟数据、纯模拟） =====
 export interface TStrategyConfig {
+  mode?: 'classic' | 'cost_vwap'
+  vwap_deviation_pct?: number
+  min_net_profit?: number
   symbol: string
   start: string
   end: string
