@@ -25,7 +25,7 @@ function seedConfig(status: TStrategyStatus): TStrategyConfig {
   const earliest = new Date(`${end}T00:00:00Z`)
   earliest.setUTCDate(earliest.getUTCDate() - 89)
   const boundedStart = Number.isFinite(earliest.getTime()) ? (start < earliest.toISOString().slice(0, 10) ? earliest.toISOString().slice(0, 10) : start) : start
-  return { ...status.defaults, symbol: '000001.SZ', start: boundedStart, end }
+  return { ...status.defaults, mode: status.defaults.mode ?? 'classic', vwap_deviation_pct: status.defaults.vwap_deviation_pct ?? 0.5, min_net_profit: status.defaults.min_net_profit ?? 10, symbol: '000001.SZ', start: boundedStart, end }
 }
 function validate(config: TStrategyConfig, needsDates: boolean): string {
   if (!/^\d{6}\.(SH|SZ|BJ)$/.test(config.symbol)) return '请输入六位股票代码及交易所后缀，如 000001.SZ'
@@ -35,6 +35,7 @@ function validate(config: TStrategyConfig, needsDates: boolean): string {
   if (![config.rise_pct, config.pullback_pct].every(n => Number.isFinite(n) && n > 0 && n <= 30)) return '上涨和回落阈值须大于 0 且不超过 30%'
   if (!Number.isFinite(config.commission_pct) || config.commission_pct < 0 || config.commission_pct > 0.01) return '佣金比例须在 0 到 0.01 之间'
   if (!Number.isFinite(config.slippage_bps) || config.slippage_bps < 0 || config.slippage_bps > 100) return '滑点须在 0 到 100 个基点之间'
+  if (config.mode === 'cost_vwap' && (!Number.isFinite(config.vwap_deviation_pct) || config.vwap_deviation_pct! < 0 || config.vwap_deviation_pct! > 10 || !Number.isFinite(config.min_net_profit) || config.min_net_profit! < 0 || config.min_net_profit! > 100000)) return '均价偏离须在0到10%，预计最低净差须在0到100000元'
   const validTime = (t: string) => /^\d{2}:\d{2}$/.test(t) && ((t >= '09:31' && t <= '11:30') || (t >= '13:01' && t < '15:00'))
   if (!validTime(config.start_time) || !validTime(config.restore_time) || config.start_time >= config.restore_time) return '开始和回补时间须在交易时段内，且开始时间早于回补时间'
   if (needsDates) {
@@ -69,6 +70,7 @@ function ResultPanel({ result }: { result: TStrategyResult }) {
   const { stats } = result
   return <section className={panelClass} aria-label="回测结果">
     <h2 className="font-semibold">回测结果 · {result.params.symbol}</h2>
+    <p className="text-xs text-muted">策略模式：{result.params.mode === 'cost_vwap' ? '成本与均价过滤' : '经典规则'}</p>
     <p className="text-xs text-muted">{result.coverage.start} 至 {result.coverage.end} · {result.coverage.sessions} 个交易日 · {result.coverage.bars} 根分钟线 · 运行编号 {result.id}</p>
     <dl className="grid grid-cols-2 gap-4 lg:grid-cols-4">
       {[
@@ -151,6 +153,12 @@ function Workspace({ status }: { status: TStrategyStatus }) {
     <form className={panelClass} onSubmit={run} noValidate>
       <h2 className="font-semibold">策略参数</h2>
       <fieldset disabled={busy} className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        <label className="space-y-1 text-xs text-secondary"><span>策略模式</span><select className={inputClass} name="mode" value={config.mode ?? 'classic'} onChange={e => field('mode', e.target.value as TStrategyConfig['mode'])}><option value="classic">经典规则（对照）</option><option value="cost_vwap">成本与均价过滤（研究）</option></select></label>
+        {config.mode === 'cost_vwap' && <>
+          <label className="space-y-1 text-xs text-secondary"><span>高于加权均价（%）</span><input className={inputClass} type="number" name="vwap_deviation_pct" step="0.1" value={config.vwap_deviation_pct} onChange={e => field('vwap_deviation_pct', Number(e.target.value))} /></label>
+          <label className="space-y-1 text-xs text-secondary"><span>预计最低净差（元）</span><input className={inputClass} type="number" name="min_net_profit" step="1" value={config.min_net_profit} onChange={e => field('min_net_profit', Number(e.target.value))} /></label>
+          <p className="text-xs leading-5 text-muted">仅卖出前增加过滤：价格高于当日成交量加权分钟收盘均价、较前一分钟回落，且按回补阈值估计净差达标。非逐笔VWAP；实际成交可能亏损。已有回补义务不受过滤影响。</p>
+        </>}
         <label className="space-y-1 text-xs text-secondary"><span>股票代码</span><input className={inputClass} name="symbol" value={config.symbol} onChange={e => field('symbol', e.target.value.trim().toUpperCase())} placeholder="000001.SZ" /></label>
         {(['start', 'end'] as const).map((key, i) => <label key={key} className="space-y-1 text-xs text-secondary"><span>{i === 0 ? '开始日期' : '结束日期'}</span><input className={inputClass} type="date" name={key} value={config[key]} onChange={e => field(key, e.target.value)} /></label>)}
         {numberFields.map(([key, label, step]) => <label key={key} className="space-y-1 text-xs text-secondary"><span>{label}</span><input className={inputClass} type="number" name={key} step={step} value={Number.isNaN(config[key]) ? '' : config[key]} onChange={e => field(key, e.target.value === '' ? NaN : Number(e.target.value))} /></label>)}

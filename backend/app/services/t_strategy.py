@@ -15,6 +15,7 @@ import time as monotonic_time
 import uuid
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from typing import Literal
 
 import polars as pl
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -24,7 +25,7 @@ from app.services.fs_utils import atomic_write_text
 from app.services.minute_adjust import minute_basis_is_raw
 from app.strategy import corporate_actions as corporate
 from app.strategy import paper
-from app.trading_costs import SUPPORTED_FROM
+from app.trading_costs import SUPPORTED_FROM, FeePolicy
 
 _RUN_LOCK = threading.Lock()
 MAX_RUNS = 20
@@ -45,6 +46,9 @@ class TConfig(BaseModel):
     restore_time: str = "14:55"
     commission_pct: float = Field(default=0.00025, ge=0, le=0.01, strict=True)
     slippage_bps: float = Field(default=5, ge=0, le=100, strict=True)
+    mode: Literal["classic", "cost_vwap"] = "classic"
+    vwap_deviation_pct: float = Field(default=0.5, ge=0, le=10, strict=True)
+    min_net_profit: float = Field(default=10.0, ge=0, le=100000, strict=True)
 
     @model_validator(mode="after")
     def bounds(self):
@@ -84,8 +88,23 @@ class ManualRequest(TConfig):
         return self
 
 
+def with_signal_context(rows: list[dict]) -> list[dict]:
+    """Volume-weighted minute closes, computed from the prefix only (not tick VWAP)."""
+    result, day, value, volume, previous = [], None, 0.0, 0.0, None
+    for row in rows:
+        if row["datetime"].date() != day:
+            day, value, volume, previous = row["datetime"].date(), 0.0, 0.0, None
+        value += row["close"] * row["volume"]
+        volume += row["volume"]
+        mean = value / volume if volume > 0 and math.isfinite(value) and math.isfinite(volume) else None
+        result.append({**row, "t_vwap": mean, "t_prev_close": previous})
+        previous = row["close"]
+    return result
+
+
 def decision(
-    config: TConfig, state: dict, bar: dict, reference: float, qty: int, available: int
+    config: TConfig, state: dict, bar: dict, reference: float, qty: int, available: int,
+    *, fee_policy: FeePolicy | None = None,
 ) -> dict | None:
     """Shared replay/manual decision; only filled sells create restoration debt."""
     stamp = bar["datetime"]
@@ -108,6 +127,23 @@ def decision(
         and available >= config.trade_qty
         and bar["close"] >= reference * (1 + config.rise_pct / 100)
     ):
+        if config.mode == "cost_vwap":
+            mean, previous = bar.get("t_vwap"), bar.get("t_prev_close")
+            if (mean is None or previous is None or bar["volume"] <= 0
+                    or bar["close"] < mean * (1 + config.vwap_deviation_pct / 100)
+                    or bar["close"] >= previous):
+                return None
+            policy = fee_policy or FeePolicy(
+                commission_pct=config.commission_pct, slippage_bps=config.slippage_bps,
+            )
+            sell_price = policy.execution_price(bar["close"], "sell")
+            buy_reference = sell_price * (1 - config.pullback_pct / 100)
+            expected_net = (
+                policy.cash_value(config.trade_qty, bar["close"], "sell", stamp.date(), "stock")
+                - policy.cash_value(config.trade_qty, buy_reference, "buy", stamp.date(), "stock")
+            )
+            if expected_net < config.min_net_profit:
+                return None
         return {"side": "sell", "qty": config.trade_qty, "purpose": "sell"}
     return None
 
@@ -383,6 +419,8 @@ class TStrategyService:
             daily, frame = self._market(config)
             days = [row["date"] for row in daily if config.start <= row["date"] <= config.end]
             rows = _validate_bars(frame, days, completed=_naive_now())
+            if config.mode == "cost_vwap":
+                rows = with_signal_context(rows)
             self._references(daily, days)  # Validate pre-window raw history before publishing.
             self.root.mkdir(parents=True, exist_ok=True)
             if len(list(self.root.glob("*/result.json"))) >= MAX_RUNS:
@@ -499,6 +537,8 @@ class TStrategyService:
                     }
                 )
             warnings = ["分钟撮合仅校验已知涨跌停与资金/T+1，不模拟Level2排队或部分成交。"]
+            if config.mode == "cost_vwap":
+                warnings.append("过滤模式使用截至信号分钟的成交量加权收盘均价（非逐笔VWAP）；预计净差仅为按回落阈值计算的成本门槛，不保证实际盈利。")
             if state.get("obligation"):
                 warnings.append(f"仍有{state['obligation']}股恢复底仓义务，未虚构成交")
             ledger = paper.load_fills(work)
@@ -668,6 +708,8 @@ class TStrategyService:
         rows = _validate_bars(
             frame, [now.date()], completed=frame["datetime"].max(), allow_partial=True
         )
+        if request.mode == "cost_vwap":
+            rows = with_signal_context(rows)
         reference = paper.ex_reference_close(self.data_dir, request.symbol, "stock", str(now.date()))
         if reference is None:
             raise ValueError("缺少前日原价/除权参考价，请同步日线与公司行动")
@@ -708,7 +750,10 @@ class TStrategyService:
                 },
             )
             state = json.loads(state_path.read_text()) if state_path.exists() else {}
-            if state.get("params") and state["params"] != params:
+            # Old bindings predate the optional guard; they retain classic behavior.
+            old_params = {"mode": "classic", "vwap_deviation_pct": 0.5,
+                          "min_net_profit": 10.0, **state.get("params", {})}
+            if state.get("params") and old_params != params:
                 raise ValueError("此账户已绑定其他做T参数，请使用独立账户")
             orders = paper.load_orders(self.data_dir, account_id)
             if any(
@@ -818,7 +863,10 @@ class TStrategyService:
                         "order": order,
                     }
             qty, available = self._position(self.data_dir, account_id, request.symbol, stamp)
-            signal = decision(request, state, bar, reference, qty, available)
+            signal = decision(request, state, bar, reference, qty, available, fee_policy=FeePolicy(
+                commission_pct=account["commission_pct"], stamp_tax_pct=account.get("stamp_tax_pct"),
+                slippage_bps=account["slippage_bps"],
+            ))
             state.update(params=params, last_bar=stamp.isoformat())
             order = None
             error = None
